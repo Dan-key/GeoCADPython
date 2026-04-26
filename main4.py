@@ -3771,13 +3771,24 @@ class SegmentApp:
         elif t == 'rect':
             if key.startswith('corner'):
                 idx = int(key[6:])
-                opp_idx = (idx + 2) % 4
-                opp = p['points'][opp_idx]
-                xs = [new_pt[0], opp[0]]
-                ys = [new_pt[1], opp[1]]
-                # axis-aligned восстановление: сохраняем порядок углов
-                p['points'] = [(xs[0], ys[0]), (xs[1], ys[0]),
-                               (xs[1], ys[1]), (xs[0], ys[1])]
+                old_pt = p['points'][idx]
+                new_pts = list(p['points'])
+                new_pts[idx] = tuple(new_pt)
+
+                # Для axis-aligned прямоугольника каждый угол делит ровно
+                # одну координату с каждым соседним углом. Если сосед раньше
+                # совпадал по X — обновляем его X; иначе — Y. Противоположный
+                # угол ((idx+2)%4) полностью независим и остаётся на месте.
+                for nb_idx in ((idx + 1) % 4, (idx - 1) % 4):
+                    nb = list(p['points'][nb_idx])
+                    if abs(nb[0] - old_pt[0]) <= abs(nb[1] - old_pt[1]):
+                        # Совпадал по X (или ректангл вырожден) → двигаем X
+                        nb[0] = new_pt[0]
+                    else:
+                        # Совпадал по Y → двигаем Y
+                        nb[1] = new_pt[1]
+                    new_pts[nb_idx] = tuple(nb)
+                p['points'] = new_pts
 
         elif t == 'ellipse':
             if key == 'center':
