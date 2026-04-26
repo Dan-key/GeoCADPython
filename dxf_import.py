@@ -858,6 +858,8 @@ def import_from_dxf(filepath):
             line_styles[style_name] = {'type': stype, 'width': 1.0}
         prim['color'] = color_hex
         prim['style_name'] = style_name
+        # Сохраняем имя DXF-слоя — будет использовано для назначения слоя в приложении.
+        prim['layer'] = layer_name
         kind = prim['type']
         name_counters[kind] = name_counters.get(kind, 0) + 1
         prim['name'] = f"{type_label.get(kind, kind)} {name_counters[kind]}"

@@ -744,16 +744,21 @@ def export_to_dxf(filepath, primitives, line_styles=None, units='mm',
     if line_styles is None:
         line_styles = {}
 
-    # 1) Собираем уникальные слои по style_name.
-    #    Цвет слоя = первый встреченный цвет среди примитивов этого стиля.
+    # 1) Собираем уникальные слои.
+    #    Приоритет: явное поле prim['layer'] (новая модель слоёв), либо
+    #    fallback — слой формируется из style_name (легаси).
     layers = {}                 # layer_name -> {'aci', 'ltype', 'rgb'}
-    style_to_layer = {}         # style_name -> layer_name
+    style_to_layer = {}         # style_name -> layer_name (для fallback)
     for prim in primitives:
         # Размеры всегда уходят на отдельный слой (не на слой их style_name)
         if is_dimension_type(prim['type']):
             continue
         style_name = prim.get('style_name') or 'Сплошная основная'
-        layer_name = sanitize_layer_name(style_name)
+        explicit_layer = prim.get('layer')
+        if explicit_layer:
+            layer_name = sanitize_layer_name(explicit_layer)
+        else:
+            layer_name = sanitize_layer_name(style_name)
         style_to_layer[style_name] = layer_name
         if layer_name not in layers:
             style = line_styles.get(style_name, {'type': 'solid'})
@@ -797,7 +802,12 @@ def export_to_dxf(filepath, primitives, line_styles=None, units='mm',
     n_entities = 0
     for prim in primitives:
         style_name = prim.get('style_name') or 'Сплошная основная'
-        layer_name = style_to_layer.get(style_name, '0')
+        # Явный слой → имеет приоритет; иначе через style_name (легаси).
+        explicit_layer = prim.get('layer')
+        if explicit_layer:
+            layer_name = sanitize_layer_name(explicit_layer)
+        else:
+            layer_name = style_to_layer.get(style_name, '0')
         layer_color = layers.get(layer_name, {}).get('aci', 7)
         color_hex = prim.get('color') or default_color
         color_aci = rgb_to_aci(hex_to_rgb(color_hex))

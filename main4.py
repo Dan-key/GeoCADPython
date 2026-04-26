@@ -62,8 +62,17 @@ class SegmentApp:
         self.point2 = None
         
         # Список примитивов САПР
-        self.primitives = []  # список {type, params, color, style_name, name, id}
+        self.primitives = []  # список {type, params, color, style_name, name, id, layer}
         self._next_prim_id = 1
+
+        # Слои чертежа. '0' — обязательный системный слой по DXF.
+        # Каждый слой: {color, visible, locked, ltype}
+        # color = '#RRGGBB' либо None ("BYLAYER берётся у примитива").
+        self.layers = {
+            '0': {'color': '#FFFFFF', 'visible': True, 'locked': False,
+                  'ltype': 'Сплошная основная'},
+        }
+        self.current_layer = '0'
 
         # Параметры размеров по умолчанию (ЕСКД ГОСТ 2.307-2011)
         self.dim_defaults = dict(
@@ -601,6 +610,30 @@ class SegmentApp:
         self.prim_hint_label.pack(fill=tk.X, padx=4, pady=(2,6))
         
         # ===== SECTION: PRIMITIVES LIST =====
+        # ===== SECTION: LAYERS =====
+        body = mk_section(left_panel, "СЛОИ")
+
+        self.layers_listbox = mk_listbox(body, height=5)
+        self.layers_listbox.pack(fill=tk.X, padx=4, pady=(4,2))
+        self.layers_listbox.bind("<<ListboxSelect>>", self.on_layer_select)
+        self.layers_listbox.bind("<Double-Button-1>", lambda e: self.toggle_layer_visible())
+
+        layer_btns = tk.Frame(body, bg=T['panel2'])
+        layer_btns.pack(fill=tk.X, padx=4, pady=2)
+        mk_btn(layer_btns, "+", self.new_layer,
+               color=T['panel'], text_color=T['accent3']).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,1))
+        mk_btn(layer_btns, "Цвет", self.change_layer_color).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        mk_btn(layer_btns, "Имя", self.rename_layer).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        mk_btn(layer_btns, "Удалить", self.delete_layer,
+               color=T['panel'], text_color=T['danger']).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1,0))
+
+        layer_btns2 = tk.Frame(body, bg=T['panel2'])
+        layer_btns2.pack(fill=tk.X, padx=4, pady=(2,6))
+        mk_btn(layer_btns2, "👁 Видим.", self.toggle_layer_visible).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,1))
+        mk_btn(layer_btns2, "🔒 Блок.", self.toggle_layer_locked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+        mk_btn(layer_btns2, "★ Текущий", self.set_current_layer_from_list,
+               color=T['accent'], text_color=T['bg']).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1,0))
+
         body = mk_section(left_panel, "СПИСОК ПРИМИТИВОВ")
 
         self.prims_listbox = mk_listbox(body, height=5)
@@ -618,6 +651,12 @@ class SegmentApp:
 
         self.prim_props_inner = tk.Frame(body, bg=T['panel2'])
         self.prim_props_inner.pack(fill=tk.X, padx=4, pady=4)
+
+        mk_label(body, "Слой:").pack(anchor='w', padx=4)
+        self.prim_layer_var = tk.StringVar(value=self.current_layer)
+        self.prim_layer_combo = mk_combobox(body, textvariable=self.prim_layer_var,
+                                              values=sorted(self.layers.keys()), state="readonly")
+        self.prim_layer_combo.pack(fill=tk.X, padx=4, pady=2)
 
         mk_label(body, "Стиль линии:").pack(anchor='w', padx=4)
         self.prim_style_var = tk.StringVar(value=self.current_style)
@@ -695,6 +734,7 @@ class SegmentApp:
         
         # Инициализация
         self.update_styles_list()
+        self.update_layers_list()
         self.root.after(100, self.redraw_all)
         
     def bind_shortcuts(self):
@@ -1019,6 +1059,13 @@ class SegmentApp:
             prim_copy['name'] = f"{prim['name'].split(' ')[0]} {offset + i}"
             prim_copy['id'] = self._next_prim_id
             self._next_prim_id += 1
+            # Регистрируем слой, если его ещё нет
+            lyr = prim_copy.get('layer') or '0'
+            if lyr not in self.layers:
+                self.layers[lyr] = {'color': prim_copy.get('color', '#FFFFFF'),
+                                    'visible': True, 'locked': False,
+                                    'ltype': prim_copy.get('style_name', 'Сплошная основная')}
+            prim_copy.setdefault('layer', '0')
             self.primitives.append(prim_copy)
 
         self._sync_segments_from_primitives()
@@ -1186,7 +1233,8 @@ class SegmentApp:
                 'style_name': self.current_style,
                 'color': self.segment_color,
                 'name': f"Отрезок {len(self.primitives) + 1}",
-                'id': self._next_prim_id
+                'id': self._next_prim_id,
+                'layer': self.current_layer,
             }
             self._next_prim_id += 1
             self.primitives.append(prim)
@@ -1477,8 +1525,12 @@ class SegmentApp:
     
     def redraw_all(self):
         self.draw_grid()
-        # Рисуем все примитивы (включая отрезки из ввода координат)
+        # Рисуем все примитивы (включая отрезки из ввода координат).
+        # Невидимые слои пропускаем целиком.
         for i, prim in enumerate(self.primitives):
+            lyr = self.layers.get(prim.get('layer', '0'))
+            if lyr and not lyr.get('visible', True):
+                continue
             selected = (i == self.selected_prim_idx)
             self.draw_primitive(prim, selected=selected)
     
@@ -2396,9 +2448,10 @@ class SegmentApp:
             messagebox.showerror("Ошибка", f"Не удалось создать примитив: {e}")
 
         if prim:
-            # Назначаем уникальный id (для ассоциативности)
+            # Назначаем уникальный id (для ассоциативности) и текущий слой.
             prim['id'] = self._next_prim_id
             self._next_prim_id += 1
+            prim.setdefault('layer', self.current_layer)
             self.primitives.append(prim)
             self._sync_segments_from_primitives()
             self.update_prims_list()
@@ -2793,8 +2846,11 @@ class SegmentApp:
             world_pts = self._arc_world_points(p['cx'], p['cy'], p['r'], p['start_angle'], p['end_angle'])
             self._draw_styled_curve(world_pts, style, sel_color, closed=False)
             if selected:
-                cx, cy = self.world_to_screen(p['cx'], p['cy'])
-                self._draw_ctrl_point(cx, cy)
+                # Рисуем все грипперы: center, start, end, mid.
+                # Используем _get_grippers как единый источник истины.
+                for g in self._get_grippers(prim):
+                    sx, sy = self.world_to_screen(*g['pt'])
+                    self._draw_ctrl_point(sx, sy)
         
         elif t == 'rect':
             corners_s = [self.world_to_screen(*pt) for pt in p['points']]
@@ -3273,6 +3329,125 @@ class SegmentApp:
                     self.draw_zigzag_line(self.canvas, ax, ay, bx, by, amp, period, width, color, "primitive")
 
     # ---- Список примитивов и выбор ----
+    # ====================================================================
+    #                          Управление слоями
+    # ====================================================================
+    def update_layers_list(self):
+        """Обновляет listbox слоёв с маркерами видимости/блокировки/текущего."""
+        self.layers_listbox.delete(0, tk.END)
+        for name in sorted(self.layers.keys()):
+            info = self.layers[name]
+            vis  = '👁' if info.get('visible', True) else '⊘'
+            lock = '🔒' if info.get('locked', False) else '  '
+            cur  = '★' if name == self.current_layer else ' '
+            color = info.get('color', '#FFFFFF')
+            self.layers_listbox.insert(tk.END, f"{cur} {vis}{lock} {name}  [{color}]")
+        # Обновим комбобокс выбора слоя в свойствах примитива
+        if hasattr(self, 'prim_layer_combo'):
+            self.prim_layer_combo['values'] = sorted(self.layers.keys())
+
+    def _selected_layer_name(self):
+        sel = self.layers_listbox.curselection()
+        if not sel:
+            return None
+        return sorted(self.layers.keys())[sel[0]]
+
+    def on_layer_select(self, event=None):
+        # Не меняем current_layer при выборе — только подсвечиваем строку.
+        pass
+
+    def new_layer(self):
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Новый слой", "Имя слоя:",
+                                       initialvalue=f"Слой {len(self.layers)+1}")
+        if not name:
+            return
+        if name in self.layers:
+            messagebox.showerror("Ошибка", f"Слой «{name}» уже существует")
+            return
+        self.layers[name] = {'color': '#FFFFFF', 'visible': True, 'locked': False,
+                             'ltype': 'Сплошная основная'}
+        self.update_layers_list()
+
+    def rename_layer(self):
+        old = self._selected_layer_name()
+        if not old:
+            return
+        if old == '0':
+            messagebox.showwarning("Слой", "Системный слой '0' переименовать нельзя")
+            return
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Переименовать слой", "Новое имя:",
+                                       initialvalue=old)
+        if not new or new == old:
+            return
+        if new in self.layers:
+            messagebox.showerror("Ошибка", f"Слой «{new}» уже существует")
+            return
+        self.layers[new] = self.layers.pop(old)
+        # Перевести все примитивы с этого слоя на новый
+        for prim in self.primitives:
+            if prim.get('layer') == old:
+                prim['layer'] = new
+        if self.current_layer == old:
+            self.current_layer = new
+        self.update_layers_list()
+        self.redraw_all()
+
+    def delete_layer(self):
+        name = self._selected_layer_name()
+        if not name:
+            return
+        if name == '0':
+            messagebox.showwarning("Слой", "Системный слой '0' удалить нельзя")
+            return
+        # Спрашиваем подтверждение, если на слое есть примитивы
+        n_on_layer = sum(1 for p in self.primitives if p.get('layer') == name)
+        if n_on_layer:
+            if not messagebox.askyesno("Удалить слой",
+                    f"На слое «{name}» — {n_on_layer} объект(ов). Перенести их на слой '0'?"):
+                return
+            for prim in self.primitives:
+                if prim.get('layer') == name:
+                    prim['layer'] = '0'
+        del self.layers[name]
+        if self.current_layer == name:
+            self.current_layer = '0'
+        self.update_layers_list()
+        self.redraw_all()
+
+    def change_layer_color(self):
+        name = self._selected_layer_name()
+        if not name:
+            return
+        color = colorchooser.askcolor(initialcolor=self.layers[name].get('color', '#FFFFFF'))
+        if color and color[1]:
+            self.layers[name]['color'] = color[1]
+            self.update_layers_list()
+            self.redraw_all()
+
+    def toggle_layer_visible(self):
+        name = self._selected_layer_name()
+        if not name:
+            return
+        self.layers[name]['visible'] = not self.layers[name].get('visible', True)
+        self.update_layers_list()
+        self.redraw_all()
+
+    def toggle_layer_locked(self):
+        name = self._selected_layer_name()
+        if not name:
+            return
+        self.layers[name]['locked'] = not self.layers[name].get('locked', False)
+        self.update_layers_list()
+
+    def set_current_layer_from_list(self):
+        name = self._selected_layer_name()
+        if not name:
+            return
+        self.current_layer = name
+        self.update_layers_list()
+
     def update_prims_list(self):
         """Обновляет список примитивов, сохраняя текущее выделение."""
         prev_sel = self.selected_prim_idx
@@ -3307,12 +3482,15 @@ class SegmentApp:
         # Не сбрасываем selected_prim_idx при потере фокуса списка
 
     def try_select_prim(self, event):
-        """Попытка выбрать примитив кликом."""
+        """Попытка выбрать примитив кликом. Невидимые/заблокированные слои пропускаем."""
         wx, wy = self.screen_to_world(event.x, event.y)
         best_i = None
         best_d = 15 / (self.scale * self.grid_step) + 0.2
-        
+
         for i, prim in enumerate(self.primitives):
+            lyr = self.layers.get(prim.get('layer', '0'))
+            if lyr and (not lyr.get('visible', True) or lyr.get('locked', False)):
+                continue
             d = self._dist_to_primitive(wx, wy, prim)
             if d < best_d:
                 best_d = d
@@ -3429,13 +3607,26 @@ class SegmentApp:
             return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
                     {'key': 'edge',   'pt': (p['cx'] + p['r'], p['cy'])}]
         if t == 'arc':
-            a1 = math.radians(p['start_angle'])
-            a2 = math.radians(p['end_angle'])
-            return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
-                    {'key': 'start',  'pt': (p['cx'] + p['r']*math.cos(a1),
-                                              p['cy'] + p['r']*math.sin(a1))},
-                    {'key': 'end',    'pt': (p['cx'] + p['r']*math.cos(a2),
-                                              p['cy'] + p['r']*math.sin(a2))}]
+            cx, cy, r = p['cx'], p['cy'], p['r']
+            a1_deg = p['start_angle']
+            a2_deg = p['end_angle']
+            a1 = math.radians(a1_deg)
+            a2 = math.radians(a2_deg)
+            # Угол середины дуги (с учётом направления CCW от a1 к a2)
+            d = a2_deg - a1_deg
+            while d < 0:
+                d += 360
+            mid_deg = a1_deg + d / 2.0
+            mid = math.radians(mid_deg)
+            return [
+                # Центр — переместить всю дугу.
+                {'key': 'center', 'pt': (cx, cy)},
+                # Start/End — только изменить соответствующий угол (радиус сохраняется).
+                {'key': 'start',  'pt': (cx + r*math.cos(a1),  cy + r*math.sin(a1))},
+                {'key': 'end',    'pt': (cx + r*math.cos(a2),  cy + r*math.sin(a2))},
+                # Mid — изменить радиус дуги (углы сохраняются).
+                {'key': 'mid',    'pt': (cx + r*math.cos(mid), cy + r*math.sin(mid))},
+            ]
         if t == 'rect':
             return [{'key': f'corner{i}', 'pt': pt} for i, pt in enumerate(p['points'])]
         if t == 'ellipse':
@@ -3564,12 +3755,18 @@ class SegmentApp:
             if key == 'center':
                 p['cx'], p['cy'] = new_pt
             elif key == 'start':
+                # Меняем только начальный угол; радиус сохраняется.
                 p['start_angle'] = math.degrees(math.atan2(new_pt[1]-p['cy'],
                                                             new_pt[0]-p['cx']))
-                p['r'] = math.hypot(new_pt[0]-p['cx'], new_pt[1]-p['cy'])
             elif key == 'end':
-                p['end_angle'] = math.degrees(math.atan2(new_pt[1]-p['cy'],
-                                                          new_pt[0]-p['cx']))
+                # Меняем только конечный угол; радиус сохраняется.
+                p['end_angle']   = math.degrees(math.atan2(new_pt[1]-p['cy'],
+                                                            new_pt[0]-p['cx']))
+            elif key == 'mid':
+                # Тащим середину дуги радиально → меняется только радиус.
+                new_r = math.hypot(new_pt[0]-p['cx'], new_pt[1]-p['cy'])
+                if new_r > 1e-6:
+                    p['r'] = new_r
 
         elif t == 'rect':
             if key.startswith('corner'):
@@ -3699,6 +3896,7 @@ class SegmentApp:
                 p['params']['vertices'] = [(x+0.5, y+0.5) for x,y in p['params']['vertices']]
             p['id'] = self._next_prim_id
             self._next_prim_id += 1
+            p.setdefault('layer', self.current_layer)
             self.primitives.append(p)
             self.update_prims_list()
             self.redraw_all()
@@ -3711,13 +3909,18 @@ class SegmentApp:
         t = prim['type']
         p = prim['params']
         
-        # Заполняем стиль и цвет
+        # Заполняем стиль, цвет и слой
         style_name = prim.get('style_name', self.current_style)
         if style_name not in self.line_styles:
             style_name = 'Сплошная основная'
         self.prim_style_var.set(style_name)
         color = prim.get('color', self.prim_default_color)
         self.prim_color_btn.config(bg=color, fg=self._contrast_fg(color))
+        layer_name = prim.get('layer', '0')
+        if layer_name not in self.layers:
+            layer_name = '0'
+        self.prim_layer_combo['values'] = sorted(self.layers.keys())
+        self.prim_layer_var.set(layer_name)
         
         # Имя
         tk.Label(self.prim_props_inner, text="Имя:", bg="#162030", fg="#5A7A98", font=("Consolas", 8)).grid(row=0, column=0, sticky=tk.W)
@@ -3902,6 +4105,10 @@ class SegmentApp:
             chosen_style = self.prim_style_var.get()
             if chosen_style in self.line_styles:
                 prim['style_name'] = chosen_style
+            # Применяем слой
+            chosen_layer = self.prim_layer_var.get()
+            if chosen_layer in self.layers:
+                prim['layer'] = chosen_layer
             
             if t == 'segment_mouse':
                 x1 = float(v['p1_0'].get()); y1 = float(v['p1_1'].get())
