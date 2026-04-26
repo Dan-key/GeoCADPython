@@ -1788,13 +1788,18 @@ class SegmentApp:
                 best_ref = ref
         
         # Касательная / Перпендикуляр — нужна «отправная» точка (откуда вести линию).
-        # Активируем для любого многоточечного инструмента с накопленной точкой.
+        # Активируем для:
+        #   * многоточечного инструмента (берём последнюю накопленную точку);
+        #   * перетаскивания гриппера (берём «противоположный» конец примитива).
         TANGENT_TOOLS = ('segment_mouse', 'polyline', 'spline',
                          'dim_linear', 'dim_angular')
-        from_pt = self.prim_points[-1] if self.prim_points else None
+        from_pt = None
+        if self.prim_points and self.current_prim_tool in TANGENT_TOOLS:
+            from_pt = self.prim_points[-1]
+        elif self.drag_ctrl_pt is not None:
+            from_pt = self._drag_from_point()
 
-        if self.snap_modes.get('tangent') and from_pt and \
-                self.current_prim_tool in TANGENT_TOOLS:
+        if self.snap_modes.get('tangent') and from_pt:
             for pt, label in self._collect_tangent_candidates(from_pt, world_x, world_y, snap_r_world):
                 d = math.hypot(world_x - pt[0], world_y - pt[1])
                 if d < best_d:
@@ -1804,8 +1809,7 @@ class SegmentApp:
                     best_ref = None
 
         # Перпендикуляр — нужна «отправная» точка (откуда опускать перпендикуляр)
-        if self.snap_modes.get('perp') and from_pt and \
-                self.current_prim_tool in TANGENT_TOOLS:
+        if self.snap_modes.get('perp') and from_pt:
             for pt, label in self._collect_perp_candidates(from_pt, world_x, world_y, snap_r_world):
                 d = math.hypot(world_x - pt[0], world_y - pt[1])
                 if d < best_d:
@@ -1835,9 +1839,14 @@ class SegmentApp:
         """Возвращает точки пересечения примитивов (отрезок-отрезок,
         отрезок-окружность, окружность-окружность и т.п.) в окрестности (wx,wy)."""
         # Извлекаем все «линейные» отрезки и окружности/дуги из примитивов.
+        # Перетаскиваемый гриппером примитив исключаем, чтобы курсор не
+        # «цеплялся» за пересечение, которое сам же двигает.
+        skip_idx = self.drag_ctrl_pt['idx'] if self.drag_ctrl_pt else None
         segs = []   # [((ax,ay),(bx,by)), ...]
         circs = []  # [(cx, cy, r, arc_range_or_None), ...]
-        for prim in self.primitives:
+        for i, prim in enumerate(self.primitives):
+            if i == skip_idx:
+                continue
             t = prim['type']; p = prim['params']
             if is_dimension_type(t):
                 continue
@@ -1986,8 +1995,11 @@ class SegmentApp:
         """
         cands = []
         fx, fy = from_pt
+        skip_idx = self.drag_ctrl_pt['idx'] if self.drag_ctrl_pt else None
 
-        for prim in self.primitives:
+        for i, prim in enumerate(self.primitives):
+            if i == skip_idx:
+                continue
             t = prim['type']
             p = prim['params']
 
@@ -2058,7 +2070,11 @@ class SegmentApp:
             foot_y = ay + t * aby
             return (foot_x, foot_y), t
 
-        for prim in self.primitives:
+        skip_idx = self.drag_ctrl_pt['idx'] if self.drag_ctrl_pt else None
+
+        for i_prim, prim in enumerate(self.primitives):
+            if i_prim == skip_idx:
+                continue
             t = prim['type']
             p = prim['params']
 
@@ -2101,8 +2117,15 @@ class SegmentApp:
         if self.snap_modes.get('center'):
             cands.append(((0.0, 0.0), "Начало координат", None))
 
+        # Идентификатор примитива, который сейчас перетаскивают грипперами —
+        # его собственные точки в кандидаты не попадают, иначе бы курсор
+        # «прилипал» к точке, которую сам же двигает.
+        skip_idx = self.drag_ctrl_pt['idx'] if self.drag_ctrl_pt else None
+
         # Привязки примитивов (исключая сами размеры)
-        for prim in self.primitives:
+        for i, prim in enumerate(self.primitives):
+            if i == skip_idx:
+                continue
             t = prim['type']
             p = prim['params']
             pid = prim.get('id')
@@ -3454,6 +3477,55 @@ class SegmentApp:
                     {'key': 'p2',       'pt': p['p2']},
                     {'key': 'arc_mid',  'pt': arc_mid_pt}]
         return []
+
+    def _drag_from_point(self):
+        """Опорная точка для касательных/перпендикуляров при перетаскивании гриппера.
+        Берём «противоположный» конец того же примитива."""
+        if self.drag_ctrl_pt is None:
+            return None
+        idx = self.drag_ctrl_pt['idx']
+        key = self.drag_ctrl_pt['key']
+        if not (0 <= idx < len(self.primitives)):
+            return None
+        prim = self.primitives[idx]
+        t = prim['type']; p = prim['params']
+
+        if t == 'segment_mouse':
+            return p['p2'] if key == 'p1' else p['p1']
+        if t == 'polyline' and key.startswith('pt'):
+            i = int(key[2:])
+            pts = p['points']
+            if i > 0:
+                return pts[i-1]
+            if i + 1 < len(pts):
+                return pts[i+1]
+        if t == 'spline' and key.startswith('pt'):
+            i = int(key[2:])
+            pts = p['points']
+            if i > 0:
+                return pts[i-1]
+            if i + 1 < len(pts):
+                return pts[i+1]
+        if t == 'circle' and key == 'edge':
+            return (p['cx'], p['cy'])
+        if t == 'arc' and key in ('start', 'end'):
+            return (p['cx'], p['cy'])
+        if t == 'rect' and key.startswith('corner'):
+            i = int(key[6:])
+            return p['points'][(i + 2) % 4]      # противоположный угол
+        if t == 'ellipse' and key in ('rx', 'ry'):
+            return (p['cx'], p['cy'])
+        if t == 'polygon' and key == 'vertex':
+            return (p['cx'], p['cy'])
+        if t == 'dim_linear':
+            if key == 'p1': return p.get('p2')
+            if key == 'p2': return p.get('p1')
+        if t == 'dim_angular':
+            if key in ('p1', 'p2', 'arc_mid'): return p.get('vertex')
+            if key == 'vertex': return p.get('p1')
+        if t == 'dim_radial':
+            if key in ('on_circle', 'text_pos'): return (p.get('cx'), p.get('cy'))
+        return None
 
     def _hit_grip(self, sx, sy, hit_radius=8):
         """Проверяет, попадает ли клик (sx,sy) в гриппер активного примитива."""
