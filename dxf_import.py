@@ -43,6 +43,12 @@
 
 import math
 import os
+import json
+
+# Имя слоя, на который dxf_export выгружает развёрнутую геометрию размеров.
+# При наличии сайдкара сущности этого слоя при импорте пропускаются,
+# чтобы не дублировать геометрию.
+DIMENSIONS_LAYER = 'Размеры'
 
 
 # ---------------------------------------------------------------------------
@@ -828,12 +834,21 @@ def import_from_dxf(filepath):
         'spline':        'Сплайн',
     }
 
+    # --- Сайдкар с описаниями размеров (если есть)
+    sidecar_dims = _read_dim_sidecar(filepath)
+    skip_dim_layer = bool(sidecar_dims)
+
     for ent, etype, sub in flattened:
+        layer_name = _get(ent, 8, '0') or '0'
+        # Если есть сайдкар — геометрию слоя «Размеры» пропускаем (она
+        # будет восстановлена из сайдкара как редактируемые размеры).
+        if skip_dim_layer and layer_name == DIMENSIONS_LAYER:
+            skipped += 1
+            continue
         prim = _convert_one(ent, etype, sub)
         if prim is None:
             skipped += 1
             continue
-        layer_name = _get(ent, 8, '0') or '0'
         layer_info = layers.get(layer_name, {'aci': 7, 'ltype': 'CONTINUOUS'})
         color_hex = _resolve_color(ent, layer_info.get('aci', 7))
         style_name = layer_to_style.get(layer_name, 'Сплошная основная')
@@ -848,6 +863,16 @@ def import_from_dxf(filepath):
         prim['name'] = f"{type_label.get(kind, kind)} {name_counters[kind]}"
         primitives.append(prim)
 
+    # --- Восстановление размеров из сайдкара
+    for d in sidecar_dims:
+        primitives.append({
+            'type':       d['type'],
+            'name':       d.get('name', d['type']),
+            'color':      d.get('color', '#FFFFFF'),
+            'style_name': d.get('style_name', 'Сплошная тонкая'),
+            'params':     d['params'],
+        })
+
     # Дополним layers HEX-цветом.
     for lname, info in layers.items():
         info['rgb'] = aci_to_rgb(info.get('aci', 7))
@@ -860,6 +885,57 @@ def import_from_dxf(filepath):
         'header':      header,
         'stats':       {'entities': len(primitives), 'skipped': skipped},
     }
+
+
+# ---------------------------------------------------------------------------
+# Сайдкар-файл с описаниями размеров.
+# ---------------------------------------------------------------------------
+
+def _read_dim_sidecar(dxf_path):
+    """Читает <dxf>.dim.json (если существует) и возвращает список размеров.
+    Файл создаётся dxf_export'ом и хранит исходные параметры размеров для
+    восстановления редактируемых объектов внутри нашего приложения.
+    Другие CAD-программы файл игнорируют."""
+    base, _ = os.path.splitext(dxf_path)
+    sidecar = base + '.dim.json'
+    if not os.path.isfile(sidecar):
+        return []
+    try:
+        with open(sidecar, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    if payload.get('format') != 'geomod-dimensions':
+        return []
+    dims = payload.get('dimensions') or []
+    out = []
+    for d in dims:
+        if not isinstance(d, dict) or 'type' not in d or 'params' not in d:
+            continue
+        # Кортежи в JSON сериализуются как списки — конвертируем обратно
+        params = _restore_param_tuples(d['params'])
+        out.append({
+            'type':       d['type'],
+            'name':       d.get('name', d['type']),
+            'color':      d.get('color', '#FFFFFF'),
+            'style_name': d.get('style_name', 'Сплошная тонкая'),
+            'params':     params,
+        })
+    return out
+
+
+def _restore_param_tuples(params):
+    """Превращает 2-элементные списки координат обратно в кортежи."""
+    result = {}
+    for k, v in params.items():
+        if isinstance(v, list) and len(v) == 2 and \
+                all(isinstance(c, (int, float)) for c in v):
+            result[k] = (float(v[0]), float(v[1]))
+        else:
+            result[k] = v
+    return result
 
 
 # ---------------------------------------------------------------------------

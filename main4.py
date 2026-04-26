@@ -5,6 +5,8 @@ import os
 
 from dxf_export import export_to_dxf
 from dxf_import import import_from_dxf
+from dimensions import (LinearDimension, RadialDimension, AngularDimension,
+                        make_dimension, is_dimension_type, arrow_polygon)
 
 class SegmentApp:
     def __init__(self, root):
@@ -60,7 +62,23 @@ class SegmentApp:
         self.point2 = None
         
         # Список примитивов САПР
-        self.primitives = []  # список {type, params, color, style_name, name}
+        self.primitives = []  # список {type, params, color, style_name, name, id}
+        self._next_prim_id = 1
+
+        # Параметры размеров по умолчанию (ЕСКД ГОСТ 2.307-2011)
+        self.dim_defaults = dict(
+            arrow_size    = 0.30,
+            text_height   = 0.35,
+            ext_overshoot = 0.15,
+            ext_offset    = 0.05,
+            dim_extension = 0.00,
+            precision     = 2,
+            arrow_filled  = True,
+            text_color    = '#FFFFFF',
+            line_color    = '#FFFFFF',
+            ext_style     = 'Сплошная тонкая',
+            dim_style     = 'Сплошная тонкая',
+        )
         
         # Привязки
         self.snap_enabled = True
@@ -69,6 +87,7 @@ class SegmentApp:
         self.snap_radius = 12  # px
         self.snap_point = None   # текущая точка привязки (world coords)
         self.snap_label = ""
+        self.snap_ref = None     # ассоц. ссылка на исходный примитив: {'prim_id', 'src_key'}
         
         # Состояние создания примитива
         self.current_prim_tool = None   # 'circle', 'arc', 'rect', 'ellipse', 'polygon', 'spline'
@@ -513,6 +532,33 @@ class SegmentApp:
         mk_btn(body, "✕  Отменить создание", self.cancel_prim_creation,
                color=T['panel'], text_color=T['warn']).pack(fill=tk.X, padx=4, pady=(2,4))
 
+        # ---- Размеры по ЕСКД ГОСТ 2.307-2011 ----
+        tk.Frame(body, bg=T['border'], height=1).pack(fill=tk.X, padx=4, pady=(2,4))
+        tk.Label(body, text="РАЗМЕРЫ (ЕСКД 2.307)", bg=T['panel2'], fg=T['text_dim'],
+                 font=("Consolas", 7, "bold")).pack(anchor='w', padx=4)
+        dim_buttons_data = [
+            ("📏  Линейный",  "dim_linear"),
+            ("⌖  Радиус",     "dim_radial_r"),
+            ("⌀  Диаметр",   "dim_radial_d"),
+            ("∠  Угловой",   "dim_angular"),
+        ]
+        dim_grid = tk.Frame(body, bg=T['panel2'])
+        dim_grid.pack(fill=tk.X, padx=4, pady=(2,4))
+        for idx, (txt, val) in enumerate(dim_buttons_data):
+            r = idx // 2
+            c = idx % 2
+            rb = tk.Radiobutton(dim_grid, text=txt, variable=self.prim_tool_var,
+                                value=val, bg=T['panel'], fg=T['accent2'],
+                                selectcolor=T['select'],
+                                activebackground=T['btn_hover'],
+                                activeforeground=T['accent'],
+                                font=FONT_MONO, relief='flat', bd=0,
+                                indicatoron=0, anchor='w',
+                                command=lambda v=val: self.activate_prim_tool(v))
+            rb.grid(row=r, column=c, padx=2, pady=1, sticky='ew', ipadx=4, ipady=3)
+        dim_grid.columnconfigure(0, weight=1)
+        dim_grid.columnconfigure(1, weight=1)
+
         mk_label(body, "Метод:").pack(anchor='w', padx=4)
         self.prim_method_label = mk_label(body, "Метод:")
         # (already packed above, hide duplicate – reuse label from below)
@@ -669,6 +715,19 @@ class SegmentApp:
         # Enter — завершить многоточечный примитив
         self.root.bind("<Return>", self.on_enter_key)
         self.root.bind("<KP_Enter>", self.on_enter_key)
+        # Delete — удалить активный примитив
+        self.root.bind("<Delete>", self.on_delete_key)
+        self.root.bind("<KP_Delete>", self.on_delete_key)
+
+    def on_delete_key(self, event=None):
+        """Удаляет активный (выделенный) примитив. Не срабатывает в полях ввода."""
+        # Не удалять, если фокус в поле ввода (Entry/Text)
+        focus = self.root.focus_get()
+        if isinstance(focus, (tk.Entry, tk.Text)):
+            return
+        if self.selected_prim_idx is not None and \
+                0 <= self.selected_prim_idx < len(self.primitives):
+            self.delete_selected_prim()
         
     def toggle_pan_mode(self):
         if self.active_tool == "pan":
@@ -804,15 +863,51 @@ class SegmentApp:
         elif self.current_prim_tool:
             self.prim_canvas_click(event)
         else:
+            # Сначала проверяем, не попали ли в гриппер активного примитива
+            grip = self._hit_grip(event.x, event.y)
+            if grip is not None:
+                self.drag_ctrl_pt = grip
+                self.canvas.config(cursor="hand2")
+                return
             self.try_select_prim(event)
-    
+
     def on_left_drag(self, event):
         if self.pan_active and self.pan_start:
             self.on_pan_move(event)
-    
+            return
+        if self.drag_ctrl_pt is not None:
+            wx, wy = self.screen_to_world(event.x, event.y)
+            # учитываем привязки при перетаскивании
+            if self.snap_enabled:
+                sp = self.find_snap_point(event.x, event.y, wx, wy)
+                if sp:
+                    wx, wy = sp
+            idx = self.drag_ctrl_pt['idx']
+            if 0 <= idx < len(self.primitives):
+                prim = self.primitives[idx]
+                self._move_gripper(prim, self.drag_ctrl_pt['key'], (wx, wy))
+                self._sync_segments_from_primitives()
+                self.redraw_all()
+                # Подсветим маркер привязки
+                if self.snap_point:
+                    sx, sy = self.world_to_screen(*self.snap_point)
+                    r = 9
+                    self.canvas.create_oval(sx-r, sy-r, sx+r, sy+r,
+                                             outline="#FF6600", width=2,
+                                             tags="snap_marker")
+
     def on_left_release(self, event):
         if self.pan_active:
             self.on_pan_end(event)
+            return
+        if self.drag_ctrl_pt is not None:
+            idx = self.drag_ctrl_pt['idx']
+            self.drag_ctrl_pt = None
+            self.canvas.config(cursor="crosshair")
+            # Обновим панель свойств после завершения перетаскивания
+            if 0 <= idx < len(self.primitives) and self.selected_prim_idx == idx:
+                self.build_prim_props_panel(self.primitives[idx])
+                self.update_prims_list()
     
     def show_context_menu(self, event):
         try:
@@ -922,6 +1017,8 @@ class SegmentApp:
         for i, prim in enumerate(data['primitives'], start=1):
             prim_copy = dict(prim)
             prim_copy['name'] = f"{prim['name'].split(' ')[0]} {offset + i}"
+            prim_copy['id'] = self._next_prim_id
+            self._next_prim_id += 1
             self.primitives.append(prim_copy)
 
         self._sync_segments_from_primitives()
@@ -1088,8 +1185,10 @@ class SegmentApp:
                 'params': {'p1': (x1, y1), 'p2': (x2, y2)},
                 'style_name': self.current_style,
                 'color': self.segment_color,
-                'name': f"Отрезок {len(self.primitives) + 1}"
+                'name': f"Отрезок {len(self.primitives) + 1}",
+                'id': self._next_prim_id
             }
+            self._next_prim_id += 1
             self.primitives.append(prim)
             
             # Совместимость — также в self.segments для update_info
@@ -1552,6 +1651,10 @@ class SegmentApp:
             'ellipse': ["Центр и две оси"],
             'polygon': ["Центр и радиус"],
             'spline':  ["По контрольным точкам (Enter/двойной клик — завершить)"],
+            'dim_linear':   ["Выровненный", "Горизонтальный", "Вертикальный"],
+            'dim_radial_r': ["Радиус (выбрать окружность/дугу)"],
+            'dim_radial_d': ["Диаметр (выбрать окружность/дугу)"],
+            'dim_angular':  ["Вершина → точка1 → точка2 → положение дуги"],
         }
         vals = methods_map.get(tool, ["Стандартный"])
         self.prim_method_combo['values'] = vals
@@ -1607,6 +1710,25 @@ class SegmentApp:
                     "Укажите следующую точку (Enter или двойной клик — завершить)",
                 ],
             },
+            'dim_linear': {
+                "Выровненный":   ["Укажите 1-ю точку измерения", "Укажите 2-ю точку измерения", "Укажите положение размерной линии"],
+                "Горизонтальный":["Укажите 1-ю точку измерения", "Укажите 2-ю точку измерения", "Укажите положение размерной линии"],
+                "Вертикальный":  ["Укажите 1-ю точку измерения", "Укажите 2-ю точку измерения", "Укажите положение размерной линии"],
+            },
+            'dim_radial_r': {
+                "Радиус (выбрать окружность/дугу)": ["Кликните по окружности/дуге", "Укажите положение надписи"],
+            },
+            'dim_radial_d': {
+                "Диаметр (выбрать окружность/дугу)": ["Кликните по окружности/дуге", "Укажите положение надписи"],
+            },
+            'dim_angular': {
+                "Вершина → точка1 → точка2 → положение дуги": [
+                    "Укажите вершину угла",
+                    "Укажите точку на 1-м луче",
+                    "Укажите точку на 2-м луче",
+                    "Укажите положение размерной дуги",
+                ],
+            },
         }
         step_hints = hints.get(tool, {}).get(method, [])
         if step < len(step_hints):
@@ -1628,6 +1750,7 @@ class SegmentApp:
         self.current_prim_tool = None
         self.prim_points = []
         self.prim_creation_step = 0
+        self.creation_mode = {}
         self.clear_prim_preview()
         self.prim_tool_var.set("")
         self.prim_hint_label.config(text="Выберите инструмент")
@@ -1647,46 +1770,220 @@ class SegmentApp:
         """Ищем ближайшую точку привязки. Радиус в пикселях, но кандидаты в мировых координатах."""
         # Радиус захвата в мировых координатах (20px → мировые)
         snap_r_world = 20.0 / (self.scale * self.grid_step)
-        
+
         best_d = snap_r_world
         best_pt = None
         best_label = ""
-        
+        best_ref = None
+
         # Базовые кандидаты (конец, середина, центр)
-        for pt, label in self._collect_snap_candidates():
+        for cand in self._collect_snap_candidates():
+            pt, label = cand[0], cand[1]
+            ref = cand[2] if len(cand) > 2 else None
             d = math.hypot(world_x - pt[0], world_y - pt[1])
             if d < best_d:
                 best_d = d
                 best_pt = pt
                 best_label = label
+                best_ref = ref
         
-        # Касательная — только когда рисуем отрезок/ломаную и уже есть первая точка
-        if self.snap_modes.get('tangent') and self.prim_points and \
-                self.current_prim_tool in ('segment_mouse', 'polyline'):
-            from_pt = self.prim_points[-1]
+        # Касательная / Перпендикуляр — нужна «отправная» точка (откуда вести линию).
+        # Активируем для любого многоточечного инструмента с накопленной точкой.
+        TANGENT_TOOLS = ('segment_mouse', 'polyline', 'spline',
+                         'dim_linear', 'dim_angular')
+        from_pt = self.prim_points[-1] if self.prim_points else None
+
+        if self.snap_modes.get('tangent') and from_pt and \
+                self.current_prim_tool in TANGENT_TOOLS:
             for pt, label in self._collect_tangent_candidates(from_pt, world_x, world_y, snap_r_world):
                 d = math.hypot(world_x - pt[0], world_y - pt[1])
                 if d < best_d:
                     best_d = d
                     best_pt = pt
                     best_label = label
-        
-        # Перпендикуляр — только когда рисуем отрезок/ломаную и уже есть первая точка
-        if self.snap_modes.get('perp') and self.prim_points and \
-                self.current_prim_tool in ('segment_mouse', 'polyline'):
-            from_pt = self.prim_points[-1]
+                    best_ref = None
+
+        # Перпендикуляр — нужна «отправная» точка (откуда опускать перпендикуляр)
+        if self.snap_modes.get('perp') and from_pt and \
+                self.current_prim_tool in TANGENT_TOOLS:
             for pt, label in self._collect_perp_candidates(from_pt, world_x, world_y, snap_r_world):
                 d = math.hypot(world_x - pt[0], world_y - pt[1])
                 if d < best_d:
                     best_d = d
                     best_pt = pt
                     best_label = label
-        
+                    best_ref = None
+
+        # Пересечение — между любыми двумя примитивами (отрезки, ломаные, дуги, окружности и т.д.)
+        if self.snap_modes.get('intersect'):
+            for pt, label in self._collect_intersection_candidates(world_x, world_y, snap_r_world):
+                d = math.hypot(world_x - pt[0], world_y - pt[1])
+                if d < best_d:
+                    best_d = d
+                    best_pt = pt
+                    best_label = label
+                    best_ref = None
+
         self.snap_label = best_label
+        self.snap_ref = best_ref
         return best_pt
 
+    # ====================================================================
+    #                        Привязка «Пересечение»
+    # ====================================================================
+    def _collect_intersection_candidates(self, wx, wy, snap_r):
+        """Возвращает точки пересечения примитивов (отрезок-отрезок,
+        отрезок-окружность, окружность-окружность и т.п.) в окрестности (wx,wy)."""
+        # Извлекаем все «линейные» отрезки и окружности/дуги из примитивов.
+        segs = []   # [((ax,ay),(bx,by)), ...]
+        circs = []  # [(cx, cy, r, arc_range_or_None), ...]
+        for prim in self.primitives:
+            t = prim['type']; p = prim['params']
+            if is_dimension_type(t):
+                continue
+            if t == 'segment_mouse':
+                segs.append((p['p1'], p['p2']))
+            elif t == 'polyline':
+                pts = p['points']
+                for i in range(len(pts) - 1):
+                    segs.append((pts[i], pts[i+1]))
+            elif t == 'rect':
+                pts = p['points']
+                for i in range(len(pts)):
+                    segs.append((pts[i], pts[(i+1) % len(pts)]))
+            elif t == 'polygon':
+                verts = p['vertices']
+                for i in range(len(verts)):
+                    segs.append((verts[i], verts[(i+1) % len(verts)]))
+            elif t == 'circle':
+                circs.append((p['cx'], p['cy'], p['r'], None))
+            elif t == 'arc':
+                circs.append((p['cx'], p['cy'], p['r'],
+                              (p['start_angle'], p['end_angle'])))
+
+        cands = []
+
+        # отрезок-отрезок
+        n = len(segs)
+        for i in range(n):
+            for j in range(i + 1, n):
+                pt = self._seg_seg_intersect(segs[i], segs[j])
+                if pt and math.hypot(pt[0]-wx, pt[1]-wy) < snap_r:
+                    cands.append((pt, "Пересечение"))
+
+        # отрезок-окружность(дуга)
+        for seg in segs:
+            for circ in circs:
+                for pt in self._seg_circle_intersect(seg, circ):
+                    if math.hypot(pt[0]-wx, pt[1]-wy) < snap_r:
+                        cands.append((pt, "Пересечение"))
+
+        # окружность(дуга)-окружность(дуга)
+        m = len(circs)
+        for i in range(m):
+            for j in range(i + 1, m):
+                for pt in self._circle_circle_intersect(circs[i], circs[j]):
+                    if math.hypot(pt[0]-wx, pt[1]-wy) < snap_r:
+                        cands.append((pt, "Пересечение"))
+
+        return cands
+
+    @staticmethod
+    def _seg_seg_intersect(s1, s2):
+        """Точка пересечения двух отрезков либо None."""
+        (x1, y1), (x2, y2) = s1
+        (x3, y3), (x4, y4) = s2
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-12:
+            return None
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / denom
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+        return None
+
+    @staticmethod
+    def _angle_in_arc(angle_deg, arc_range):
+        """True если angle_deg попадает в дугу [a1..a2] CCW."""
+        a1, a2 = arc_range
+        while a2 < a1:
+            a2 += 360.0
+        ang = angle_deg
+        while ang < a1:
+            ang += 360.0
+        return ang <= a2
+
+    @classmethod
+    def _seg_circle_intersect(cls, seg, circ):
+        """Точки пересечения отрезка с окружностью или дугой."""
+        (x1, y1), (x2, y2) = seg
+        cx, cy, r, arc_range = circ
+        dx, dy = x2 - x1, y2 - y1
+        if dx*dx + dy*dy < 1e-20:
+            return []
+        fx, fy = x1 - cx, y1 - cy
+        a = dx*dx + dy*dy
+        b = 2*(fx*dx + fy*dy)
+        c = fx*fx + fy*fy - r*r
+        disc = b*b - 4*a*c
+        if disc < 0:
+            return []
+        sq = math.sqrt(disc)
+        out = []
+        for t in ((-b - sq) / (2*a), (-b + sq) / (2*a)):
+            if 0.0 <= t <= 1.0:
+                px = x1 + t*dx
+                py = y1 + t*dy
+                if arc_range is not None:
+                    ang = math.degrees(math.atan2(py-cy, px-cx))
+                    if not cls._angle_in_arc(ang, arc_range):
+                        continue
+                out.append((px, py))
+        return out
+
+    @classmethod
+    def _circle_circle_intersect(cls, c1, c2):
+        """Точки пересечения двух окружностей (и/или дуг)."""
+        cx1, cy1, r1, ar1 = c1
+        cx2, cy2, r2, ar2 = c2
+        dx, dy = cx2 - cx1, cy2 - cy1
+        d = math.hypot(dx, dy)
+        if d < 1e-12:
+            return []
+        if d > r1 + r2 + 1e-9 or d < abs(r1 - r2) - 1e-9:
+            return []
+        a = (r1*r1 - r2*r2 + d*d) / (2.0*d)
+        h_sq = r1*r1 - a*a
+        if h_sq < 0:
+            return []
+        h = math.sqrt(h_sq)
+        px = cx1 + a*dx/d
+        py = cy1 + a*dy/d
+        rx = -dy * (h/d)
+        ry =  dx * (h/d)
+        candidates = [(px + rx, py + ry), (px - rx, py - ry)]
+        out = []
+        for ix, iy in candidates:
+            ok = True
+            for cx, cy, _r, ar in ((cx1, cy1, r1, ar1), (cx2, cy2, r2, ar2)):
+                if ar is not None:
+                    ang = math.degrees(math.atan2(iy-cy, ix-cx))
+                    if not cls._angle_in_arc(ang, ar):
+                        ok = False
+                        break
+            if ok:
+                out.append((ix, iy))
+        return out
+
     def _collect_tangent_candidates(self, from_pt, wx, wy, snap_r):
-        """Касательная: возвращаем ПРОЕКЦИЮ курсора на линию касательной."""
+        """Касательная к окружности/дуге.
+
+        Поведение: пока курсор находится вблизи касательной прямой
+        (проведённой из from_pt через точку касания), снап «скользит»
+        вдоль этой прямой — кандидат = проекция курсора на прямую.
+        Это позволяет вытягивать отрезок дальше точки касания, как в
+        AutoCAD/КОМПАС.
+        """
         cands = []
         fx, fy = from_pt
 
@@ -1694,51 +1991,51 @@ class SegmentApp:
             t = prim['type']
             p = prim['params']
 
-            if t in ('circle', 'arc'):
-                cx, cy, r = p['cx'], p['cy'], p['r']
+            if t not in ('circle', 'arc'):
+                continue
 
-                dist = math.hypot(fx - cx, fy - cy)
-                if dist <= r:
-                    continue  # внутри окружности касательной нет
+            cx, cy, r = p['cx'], p['cy'], p['r']
+            dist = math.hypot(fx - cx, fy - cy)
+            if dist <= r * (1.0 + 1e-9):
+                continue  # точка внутри/на окружности — касательной нет
 
-                base_angle = math.atan2(cy - fy, cx - fx)
-                half_angle = math.asin(r / dist)
+            # Угол центр→from_pt и поправка на радиус-к-точке-касания.
+            base_angle = math.atan2(fy - cy, fx - cx)
+            half = math.acos(r / dist)
 
-                for sign in (+1, -1):
-                    tang_angle = base_angle + sign * half_angle
+            for sign in (+1, -1):
+                touch_angle = base_angle + sign * half
+                tx = cx + r * math.cos(touch_angle)
+                ty = cy + r * math.sin(touch_angle)
 
-                    # направление касательной
-                    dx = math.cos(tang_angle)
-                    dy = math.sin(tang_angle)
-
-                    # точка касания
-                    t_param = (cx - fx)*dx + (cy - fy)*dy
-                    foot_x = fx + t_param * dx
-                    foot_y = fy + t_param * dy
-
-                    perp_dx = cx - foot_x
-                    perp_dy = cy - foot_y
-                    perp_len = math.hypot(perp_dx, perp_dy)
-                    if perp_len < 1e-10:
+                # Для дуги — точка касания должна лежать в её угловом диапазоне.
+                if t == 'arc':
+                    ang_deg = math.degrees(touch_angle)
+                    if not self._angle_in_arc(ang_deg,
+                                              (p['start_angle'], p['end_angle'])):
                         continue
 
-                    touch_x = cx - r * perp_dx / perp_len
-                    touch_y = cy - r * perp_dy / perp_len
+                # Направляющий вектор касательной = единичный from_pt → touch.
+                ux = tx - fx
+                uy = ty - fy
+                ulen = math.hypot(ux, uy)
+                if ulen < 1e-12:
+                    continue
+                ux /= ulen
+                uy /= ulen
 
-                    # 🔥 ПРОЕКЦИЯ КУРСОРА НА КАСАТЕЛЬНУЮ
-                    vx = wx - touch_x
-                    vy = wy - touch_y
+                # Проекция курсора на прямую (from_pt + t·u).
+                vx = wx - fx
+                vy = wy - fy
+                tparam = vx * ux + vy * uy
+                proj_x = fx + tparam * ux
+                proj_y = fy + tparam * uy
 
-                    proj_len = vx * dx + vy * dy
-
-                    proj_x = touch_x + proj_len * dx
-                    proj_y = touch_y + proj_len * dy
-
-                    # проверяем расстояние до линии
-                    dist_to_line = math.hypot(wx - proj_x, wy - proj_y)
-
-                    if dist_to_line < snap_r:
-                        cands.append(((proj_x, proj_y), "Касательная"))
+                # Снап активен, если курсор близко к самой прямой
+                # (перпендикулярное расстояние < snap_r).
+                dist_to_line = math.hypot(wx - proj_x, wy - proj_y)
+                if dist_to_line < snap_r:
+                    cands.append(((proj_x, proj_y), "Касательная"))
 
         return cands
 
@@ -1796,62 +2093,82 @@ class SegmentApp:
         return cands
 
     def _collect_snap_candidates(self):
-        """Собираем базовые точки привязки (конец, середина, центр, начало координат)."""
+        """Собираем базовые точки привязки (конец, середина, центр, начало координат).
+        Каждый кандидат — кортеж (point, label, ref). ref = {'prim_id', 'src_key'} либо None."""
         cands = []
 
         # 🔥 Начало мировой системы координат
         if self.snap_modes.get('center'):
-            cands.append(((0.0, 0.0), "Начало координат"))
+            cands.append(((0.0, 0.0), "Начало координат", None))
 
-        # Привязки примитивов
+        # Привязки примитивов (исключая сами размеры)
         for prim in self.primitives:
             t = prim['type']
             p = prim['params']
+            pid = prim.get('id')
+
+            # Размеры не служат источниками привязок (чтобы не цеплялись за себя)
+            if is_dimension_type(t):
+                continue
 
             if t == 'segment_mouse':
                 if self.snap_modes['end']:
-                    cands.append((p['p1'], "Конец"))
-                    cands.append((p['p2'], "Конец"))
+                    cands.append((p['p1'], "Конец", {'prim_id': pid, 'src_key': 'p1'}))
+                    cands.append((p['p2'], "Конец", {'prim_id': pid, 'src_key': 'p2'}))
                 if self.snap_modes['mid']:
                     mid = ((p['p1'][0]+p['p2'][0])/2,
                         (p['p1'][1]+p['p2'][1])/2)
-                    cands.append((mid, "Середина"))
+                    cands.append((mid, "Середина", {'prim_id': pid, 'src_key': 'mid'}))
 
             elif t == 'polyline':
                 pts = p['points']
                 if self.snap_modes['end'] and pts:
-                    cands.append((pts[0], "Конец"))
-                    cands.append((pts[-1], "Конец"))
+                    cands.append((pts[0], "Конец", {'prim_id': pid, 'src_key': 'pt0'}))
+                    cands.append((pts[-1], "Конец", {'prim_id': pid, 'src_key': f'pt{len(pts)-1}'}))
                 if self.snap_modes['mid']:
                     for i in range(len(pts)-1):
                         mid = ((pts[i][0]+pts[i+1][0])/2,
                             (pts[i][1]+pts[i+1][1])/2)
-                        cands.append((mid, "Середина"))
+                        cands.append((mid, "Середина", None))
 
             elif t == 'circle':
                 cx, cy, r = p['cx'], p['cy'], p['r']
                 if self.snap_modes['center']:
-                    cands.append(((cx, cy), "Центр"))
+                    cands.append(((cx, cy), "Центр", {'prim_id': pid, 'src_key': 'center'}))
                 if self.snap_modes['end']:
                     for a in [0, 90, 180, 270]:
                         ar = math.radians(a)
                         cands.append(((cx + r*math.cos(ar),
-                                    cy + r*math.sin(ar)), "Квадрант"))
+                                    cy + r*math.sin(ar)), "Квадрант", None))
 
             elif t == 'arc':
                 cx, cy = p['cx'], p['cy']
                 r, a1, a2 = p['r'], p['start_angle'], p['end_angle']
                 if self.snap_modes['center']:
-                    cands.append(((cx, cy), "Центр"))
+                    cands.append(((cx, cy), "Центр", {'prim_id': pid, 'src_key': 'center'}))
                 if self.snap_modes['end']:
                     cands.append(((cx + r*math.cos(math.radians(a1)),
-                                cy + r*math.sin(math.radians(a1))), "Конец"))
+                                cy + r*math.sin(math.radians(a1))), "Конец",
+                                {'prim_id': pid, 'src_key': 'arc_start'}))
                     cands.append(((cx + r*math.cos(math.radians(a2)),
-                                cy + r*math.sin(math.radians(a2))), "Конец"))
+                                cy + r*math.sin(math.radians(a2))), "Конец",
+                                {'prim_id': pid, 'src_key': 'arc_end'}))
                 if self.snap_modes['mid']:
                     am = (a1 + a2) / 2
                     cands.append(((cx + r*math.cos(math.radians(am)),
-                                cy + r*math.sin(math.radians(am))), "Середина"))
+                                cy + r*math.sin(math.radians(am))), "Середина", None))
+
+            elif t == 'rect':
+                pts = p['points']
+                if self.snap_modes['end']:
+                    for i, pt in enumerate(pts):
+                        cands.append((pt, "Конец", {'prim_id': pid, 'src_key': f'corner{i}'}))
+
+            elif t == 'polygon':
+                verts = p['vertices']
+                if self.snap_modes['end']:
+                    for i, v in enumerate(verts):
+                        cands.append((v, "Конец", {'prim_id': pid, 'src_key': f'vert{i}'}))
 
         return cands
 
@@ -1860,54 +2177,109 @@ class SegmentApp:
         wx, wy = self.screen_to_world(event.x, event.y)
         if self.snap_point:
             wx, wy = self.snap_point
-        
+
         tool = self.current_prim_tool
         method = self.creation_mode.get('method', '')
-        
+
+        # ---- Размеры: специальная обработка первого клика для радиальных ----
+        if tool in ('dim_radial_r', 'dim_radial_d') and len(self.prim_points) == 0:
+            # Первый клик: выбираем окружность/дугу примитив, ближайшую к точке клика
+            target = self._pick_circle_or_arc(wx, wy)
+            if target is None:
+                self.prim_hint_label.config(
+                    text="Не найдено окружность/дугу рядом — кликните на окружность/дугу")
+                return
+            self.creation_mode['target_prim_id'] = target['id']
+            self.creation_mode['target_cx'] = target['params']['cx']
+            self.creation_mode['target_cy'] = target['params']['cy']
+            self.creation_mode['target_r']  = target['params']['r']
+            # Запоминаем точку клика как "псевдоточку" для определения угла
+            self.prim_points.append((wx, wy))
+            self.prim_creation_step += 1
+            self.update_prim_hint()
+            return
+
+        # Захватываем ассоциативную привязку (если кликнули на снап-точку с ref'ом)
+        if self.snap_point and self.snap_ref:
+            if 'snap_refs' not in self.creation_mode:
+                self.creation_mode['snap_refs'] = []
+            self.creation_mode['snap_refs'].append(dict(self.snap_ref))
+        else:
+            if 'snap_refs' not in self.creation_mode:
+                self.creation_mode['snap_refs'] = []
+            self.creation_mode['snap_refs'].append(None)
+
         self.prim_points.append((wx, wy))
         self.prim_creation_step += 1
-        
+
         # Проверяем, нужно ли завершить примитив
         done = False
-        
+
         if tool == 'segment_mouse':
             if len(self.prim_points) == 2:
                 done = True
-        
+
         elif tool == 'polyline':
             # Продолжаем добавлять точки, завершение по Enter/двойному клику
             done = False
-        
+
         elif tool == 'circle':
             if method in ("Центр и радиус", "Центр и диаметр", "По двум точкам") and len(self.prim_points) == 2:
                 done = True
             elif method == "По трём точкам" and len(self.prim_points) == 3:
                 done = True
-        
+
         elif tool == 'arc':
             if len(self.prim_points) == 3:
                 done = True
-        
+
         elif tool == 'rect':
             if len(self.prim_points) == 2:
                 done = True
-        
+
         elif tool == 'ellipse':
             if len(self.prim_points) == 3:
                 done = True
-        
+
         elif tool == 'polygon':
             if len(self.prim_points) == 2:
                 done = True
-        
+
         elif tool == 'spline':
             # Добавляем точки, завершение по двойному клику
             done = False
-        
+
+        elif tool == 'dim_linear':
+            if len(self.prim_points) == 3:
+                done = True
+
+        elif tool in ('dim_radial_r', 'dim_radial_d'):
+            if len(self.prim_points) == 2:
+                done = True
+
+        elif tool == 'dim_angular':
+            if len(self.prim_points) == 4:
+                done = True
+
         if done:
             self.finalize_primitive()
         else:
             self.update_prim_hint()
+
+    def _pick_circle_or_arc(self, wx, wy):
+        """Находит ближайшую окружность или дугу к точке (wx, wy)."""
+        best = None
+        best_d = float('inf')
+        for prim in self.primitives:
+            if prim['type'] in ('circle', 'arc'):
+                p = prim['params']
+                d = abs(math.hypot(wx - p['cx'], wy - p['cy']) - p['r'])
+                # Принимаем, если расстояние < 25% радиуса или < 0.7 ед.
+                tol = max(0.7, 0.25 * p['r'])
+                if d < tol and d < best_d:
+                    best_d = d
+                    best = prim
+        return best
 
     def on_canvas_double_click(self, event):
         """Двойной клик — завершение многоточечных примитивов."""
@@ -1984,18 +2356,105 @@ class SegmentApp:
                 if len(pts) >= 2:
                     prim = {'type': 'spline', 'params': {'points': list(pts)}, 'color': color,
                             'style_name': style_name, 'name': f"Сплайн {len(self.primitives)+1}"}
-        
+
+            elif tool == 'dim_linear':
+                prim = self._build_dim_linear(pts, method)
+
+            elif tool == 'dim_radial_r':
+                prim = self._build_dim_radial(pts, kind='radius')
+
+            elif tool == 'dim_radial_d':
+                prim = self._build_dim_radial(pts, kind='diameter')
+
+            elif tool == 'dim_angular':
+                prim = self._build_dim_angular(pts)
+
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось создать примитив: {e}")
-        
+
         if prim:
+            # Назначаем уникальный id (для ассоциативности)
+            prim['id'] = self._next_prim_id
+            self._next_prim_id += 1
             self.primitives.append(prim)
             self._sync_segments_from_primitives()
             self.update_prims_list()
             self.update_segments_list()
-        
+
         self._reset_prim_tool()
         self.redraw_all()
+
+    # ---- Построители размеров ----
+    def _build_dim_linear(self, pts, method):
+        if len(pts) < 3:
+            return None
+        orient_map = {
+            "Выровненный":    LinearDimension.ORIENT_ALIGNED,
+            "Горизонтальный": LinearDimension.ORIENT_HORIZONTAL,
+            "Вертикальный":   LinearDimension.ORIENT_VERTICAL,
+        }
+        orientation = orient_map.get(method, LinearDimension.ORIENT_ALIGNED)
+        # Ассоциативные ссылки для p1 и p2 (если были захвачены snap'ом)
+        refs = self.creation_mode.get('snap_refs', [])
+        assoc = []
+        if len(refs) >= 1 and refs[0]:
+            assoc.append({'point_key': 'p1', **refs[0]})
+        if len(refs) >= 2 and refs[1]:
+            assoc.append({'point_key': 'p2', **refs[1]})
+        dim = LinearDimension(pts[0], pts[1], pts[2],
+                              orientation=orientation,
+                              assoc=assoc, **self.dim_defaults)
+        return {'type': dim.KIND, 'params': dim.to_params(),
+                'color': self.dim_defaults['line_color'],
+                'style_name': self.dim_defaults['dim_style'],
+                'name': f"Размер лин. {len(self.primitives)+1}"}
+
+    def _build_dim_radial(self, pts, kind='radius'):
+        if len(pts) < 2:
+            return None
+        cx = self.creation_mode.get('target_cx')
+        cy = self.creation_mode.get('target_cy')
+        r  = self.creation_mode.get('target_r')
+        target_id = self.creation_mode.get('target_prim_id')
+        if cx is None or r is None:
+            return None
+        # Угол радиальной линии — от центра к точке текста
+        text_pt = pts[1]
+        angle = math.degrees(math.atan2(text_pt[1] - cy, text_pt[0] - cx))
+        assoc = [{'point_key': 'circle', 'prim_id': target_id, 'src_key': 'circle'}] if target_id else []
+        # У диаметра по ЕСКД по умолчанию надпись на полке-выноске
+        defaults = dict(self.dim_defaults)
+        if kind == 'diameter':
+            defaults['with_shelf'] = True
+        dim = RadialDimension(cx, cy, r, angle, kind=kind,
+                              text_pos=text_pt, assoc=assoc,
+                              **defaults)
+        type_label = 'диаметр' if kind == 'diameter' else 'радиус'
+        return {'type': dim.KIND, 'params': dim.to_params(),
+                'color': self.dim_defaults['line_color'],
+                'style_name': self.dim_defaults['dim_style'],
+                'name': f"Размер {type_label} {len(self.primitives)+1}"}
+
+    def _build_dim_angular(self, pts):
+        if len(pts) < 4:
+            return None
+        vertex, p1, p2, dim_pos = pts[0], pts[1], pts[2], pts[3]
+        # Радиус дуги = расстояние от вершины до точки положения
+        arc_r = math.hypot(dim_pos[0]-vertex[0], dim_pos[1]-vertex[1])
+        if arc_r < 1e-6:
+            arc_r = max(math.hypot(p1[0]-vertex[0], p1[1]-vertex[1]),
+                        math.hypot(p2[0]-vertex[0], p2[1]-vertex[1])) * 0.6
+        refs = self.creation_mode.get('snap_refs', [])
+        assoc = []
+        for i, key in enumerate(('vertex', 'p1', 'p2')):
+            if i < len(refs) and refs[i]:
+                assoc.append({'point_key': key, **refs[i]})
+        dim = AngularDimension(vertex, p1, p2, arc_r,
+                               assoc=assoc, **self.dim_defaults)
+        return {'type': dim.KIND, 'params': dim.to_params(),
+                'color': self.dim_defaults['line_color'],
+                'style_name': self.dim_defaults['dim_style'],
+                'name': f"Размер угл. {len(self.primitives)+1}"}
 
     # ---- Построители параметров примитивов ----
     def _build_circle_params(self, method, pts):
@@ -2138,6 +2597,72 @@ class SegmentApp:
             
             elif tool == 'spline' and len(pts) >= 2:
                 self._preview_spline(pts)
+
+            elif tool == 'dim_linear' and len(pts) >= 2:
+                # Превью: показываем линию между p1 и p2 пунктиром,
+                # и (если есть 3-я точка) — размерную линию
+                p1s = self.world_to_screen(*pts[0])
+                p2s = self.world_to_screen(*pts[1])
+                self.canvas.create_line(*p1s, *p2s, fill="#FFA500", width=1, dash=(2,3),
+                                         tags="prim_preview")
+                if len(pts) >= 3:
+                    method = self.creation_mode.get('method', '')
+                    orient_map = {
+                        "Выровненный":    LinearDimension.ORIENT_ALIGNED,
+                        "Горизонтальный": LinearDimension.ORIENT_HORIZONTAL,
+                        "Вертикальный":   LinearDimension.ORIENT_VERTICAL,
+                    }
+                    orient = orient_map.get(method, LinearDimension.ORIENT_ALIGNED)
+                    dim = LinearDimension(pts[0], pts[1], pts[2], orientation=orient,
+                                          **self.dim_defaults)
+                    g = dim.geometry()
+                    e1s = self.world_to_screen(*g['e1'])
+                    e2s = self.world_to_screen(*g['e2'])
+                    self.canvas.create_line(*e1s, *e2s, fill="#888888", width=1,
+                                             dash=(4,4), tags="prim_preview")
+
+            elif tool in ('dim_radial_r', 'dim_radial_d') and len(pts) >= 1:
+                cx = self.creation_mode.get('target_cx')
+                cy = self.creation_mode.get('target_cy')
+                r  = self.creation_mode.get('target_r')
+                if cx is not None and r is not None:
+                    text_pt = pts[-1]
+                    a = math.atan2(text_pt[1] - cy, text_pt[0] - cx)
+                    on_circle = (cx + r*math.cos(a), cy + r*math.sin(a))
+                    sc = self.world_to_screen(cx, cy)
+                    so = self.world_to_screen(*on_circle)
+                    st = self.world_to_screen(*text_pt)
+                    self.canvas.create_line(*sc, *so, fill="#888888", width=1,
+                                             dash=(4,4), tags="prim_preview")
+                    self.canvas.create_line(*so, *st, fill="#888888", width=1,
+                                             dash=(4,4), tags="prim_preview")
+
+            elif tool == 'dim_angular' and len(pts) >= 3:
+                v = pts[0]
+                pp1, pp2 = pts[1], pts[2]
+                # дуги ещё нет — покажем лучи
+                for q in (pp1, pp2):
+                    sv = self.world_to_screen(*v)
+                    sq = self.world_to_screen(*q)
+                    self.canvas.create_line(*sv, *sq, fill="#FFA500", width=1,
+                                             dash=(2,3), tags="prim_preview")
+                if len(pts) >= 4:
+                    arc_r = math.hypot(pts[3][0]-v[0], pts[3][1]-v[1])
+                    a1 = math.atan2(pp1[1]-v[1], pp1[0]-v[0])
+                    a2 = math.atan2(pp2[1]-v[1], pp2[0]-v[0])
+                    d = a2 - a1
+                    while d >  math.pi: d -= 2*math.pi
+                    while d < -math.pi: d += 2*math.pi
+                    steps = 32
+                    pts_s = []
+                    for i in range(steps+1):
+                        a = a1 + d * (i/steps)
+                        wp = (v[0] + arc_r*math.cos(a), v[1] + arc_r*math.sin(a))
+                        sxx, syy = self.world_to_screen(*wp)
+                        pts_s.extend([sxx, syy])
+                    if len(pts_s) >= 4:
+                        self.canvas.create_line(*pts_s, fill="#888888", width=1,
+                                                 dash=(4,4), tags="prim_preview")
         except:
             pass
         
@@ -2285,6 +2810,358 @@ class SegmentApp:
                     px, py = self.world_to_screen(*pt)
                     self._draw_ctrl_point(px, py)
 
+        elif is_dimension_type(t):
+            self._draw_dimension(prim, selected=selected)
+
+    # ====================================================================
+    #                    Отрисовка размеров по ЕСКД
+    # ====================================================================
+    def _find_prim_by_id(self, pid):
+        if pid is None:
+            return None
+        for pr in self.primitives:
+            if pr.get('id') == pid:
+                return pr
+        return None
+
+    def _resolve_assoc_point(self, ref):
+        """Возвращает актуальные координаты точки по ассоциативной ссылке либо None."""
+        if not ref:
+            return None
+        src = self._find_prim_by_id(ref.get('prim_id'))
+        if src is None:
+            return None
+        key = ref.get('src_key')
+        sp = src['params']
+        st = src['type']
+        try:
+            if st == 'segment_mouse':
+                if key == 'p1': return sp['p1']
+                if key == 'p2': return sp['p2']
+                if key == 'mid':
+                    return ((sp['p1'][0]+sp['p2'][0])/2, (sp['p1'][1]+sp['p2'][1])/2)
+            elif st == 'polyline':
+                if key and key.startswith('pt'):
+                    idx = int(key[2:])
+                    pts = sp['points']
+                    if 0 <= idx < len(pts):
+                        return pts[idx]
+            elif st in ('circle', 'arc'):
+                if key == 'center':
+                    return (sp['cx'], sp['cy'])
+                if key == 'circle':
+                    return (sp['cx'], sp['cy'])
+            elif st == 'rect':
+                if key and key.startswith('corner'):
+                    idx = int(key[6:])
+                    pts = sp['points']
+                    if 0 <= idx < len(pts):
+                        return pts[idx]
+            elif st == 'polygon':
+                if key and key.startswith('vert'):
+                    idx = int(key[4:])
+                    verts = sp['vertices']
+                    if 0 <= idx < len(verts):
+                        return verts[idx]
+        except Exception:
+            return None
+        return None
+
+    def _refresh_dim_assoc(self, prim):
+        """Пересчитывает p1/p2/cx/cy и т.п. размера из ассоциативных ссылок."""
+        params = prim['params']
+        for ref in params.get('assoc', []):
+            pt = self._resolve_assoc_point(ref)
+            if pt is None:
+                continue
+            key = ref.get('point_key')
+            if key in ('p1', 'p2', 'vertex'):
+                params[key] = pt
+            elif key == 'circle':
+                # точка-центр окружности
+                params['cx'] = pt[0]
+                params['cy'] = pt[1]
+                # также обновить r из исходной окружности, если возможно
+                src = self._find_prim_by_id(ref.get('prim_id'))
+                if src and src['type'] in ('circle', 'arc'):
+                    params['r'] = src['params']['r']
+
+    def _draw_dimension(self, prim, selected=False):
+        """Рисует размер по ЕСКД ГОСТ 2.307-2011."""
+        # Обновляем поля по ассоциативным ссылкам (если есть)
+        self._refresh_dim_assoc(prim)
+
+        try:
+            dim = make_dimension(prim['type'], prim['params'])
+        except Exception:
+            return
+
+        sel_color = "#00AAFF" if selected else (prim.get('color') or dim.line_color)
+        text_color = sel_color if selected else dim.text_color
+        ext_style = self.line_styles.get(dim.ext_style, {'type': 'solid', 'width': 1.0})
+        dim_style = self.line_styles.get(dim.dim_style, {'type': 'solid', 'width': 1.0})
+
+        if isinstance(dim, LinearDimension):
+            self._draw_dim_linear(dim, sel_color, text_color, ext_style, dim_style, selected)
+        elif isinstance(dim, RadialDimension):
+            self._draw_dim_radial(dim, sel_color, text_color, dim_style, selected)
+        elif isinstance(dim, AngularDimension):
+            self._draw_dim_angular(dim, sel_color, text_color, dim_style, selected)
+
+    def _scr(self, pt):
+        return self.world_to_screen(pt[0], pt[1])
+
+    def _draw_dim_arrow(self, tip_world, dir_world, size_world, color, filled=True):
+        """Рисует одну стрелку в мировых координатах."""
+        tri = arrow_polygon(tip_world, dir_world, size_world)
+        sx = []
+        for pt in tri:
+            x, y = self._scr(pt)
+            sx.extend([x, y])
+        if filled:
+            self.canvas.create_polygon(*sx, fill=color, outline=color, tags="primitive")
+        else:
+            self.canvas.create_polygon(*sx, fill='', outline=color, width=1.2, tags="primitive")
+
+    def _draw_dim_linear(self, dim, color, text_color, ext_style, dim_style, selected):
+        g = dim.geometry()
+        e1, e2 = g['e1'], g['e2']
+        p1, p2 = g['p1'], g['p2']
+        nrm = g['normal']
+
+        # Длина по размерной линии
+        L = math.hypot(e2[0]-e1[0], e2[1]-e1[1])
+        if L < 1e-9:
+            return
+        dir_ = ((e2[0]-e1[0])/L, (e2[1]-e1[1])/L)
+
+        # --- 1. Выносные линии ---
+        # От точки измерения, со зазором ext_offset до проекции, с выходом ext_overshoot за неё
+        for src, foot in ((p1, e1), (p2, e2)):
+            vx = foot[0] - src[0]
+            vy = foot[1] - src[1]
+            vl = math.hypot(vx, vy)
+            if vl < 1e-9:
+                # точка измерения совпадает с проекцией — рисуем перпендикуляр
+                vx, vy = nrm
+                vl = 1.0
+            ux, uy = vx/vl, vy/vl
+            # начало с зазором от точки измерения
+            start = (src[0] + ux * dim.ext_offset, src[1] + uy * dim.ext_offset)
+            end   = (foot[0] + ux * dim.ext_overshoot, foot[1] + uy * dim.ext_overshoot)
+            sx1, sy1 = self._scr(start)
+            sx2, sy2 = self._scr(end)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   ext_style, color, tags="primitive")
+
+        # --- 2. Размерная линия (с расширением dim_extension за выносные) ---
+        ext = dim.dim_extension
+        L_world = (dir_[0] * ext, dir_[1] * ext)
+        d1 = (e1[0] - L_world[0], e1[1] - L_world[1])
+        d2 = (e2[0] + L_world[0], e2[1] + L_world[1])
+        sx1, sy1 = self._scr(d1)
+        sx2, sy2 = self._scr(d2)
+        self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                               dim_style, color, tags="primitive")
+
+        # --- 3. Стрелки на концах размерной линии (направлены наружу к выносным) ---
+        self._draw_dim_arrow(e1, (-dir_[0], -dir_[1]), dim.arrow_size, color, dim.arrow_filled)
+        self._draw_dim_arrow(e2,  dir_,                dim.arrow_size, color, dim.arrow_filled)
+
+        # --- 4. Текст ---
+        mid = ((e1[0]+e2[0])/2, (e1[1]+e2[1])/2)
+        # Смещаем текст от размерной линии на text_height/2 в сторону, противоположную геометрии
+        # ЕСКД: текст над размерной линией со стороны, противоположной геометрии
+        avg_geom = ((p1[0]+p2[0])/2, (p1[1]+p2[1])/2)
+        vec_to_geom = (avg_geom[0] - mid[0], avg_geom[1] - mid[1])
+        side = vec_to_geom[0]*nrm[0] + vec_to_geom[1]*nrm[1]
+        text_nrm = nrm if side < 0 else (-nrm[0], -nrm[1])
+        offset = dim.text_height * 0.7
+        tx = mid[0] + text_nrm[0] * offset
+        ty = mid[1] + text_nrm[1] * offset
+        sxt, syt = self._scr((tx, ty))
+
+        # Размер шрифта в пикселях по экрану
+        font_size = max(8, int(dim.text_height * self.scale * self.grid_step * 0.9))
+        # Угол поворота текста по направлению размерной линии
+        # tkinter angle: 0 — горизонтально, поворот против часовой
+        # Текст ориентируется ПАРАЛЛЕЛЬНО размерной линии (ЕСКД ГОСТ 2.307-2011 п.4.6).
+        # Tk angle: положительный = против часовой; world Y направлена вверх,
+        # screen Y — вниз, поэтому учитываем поворот вьюпорта вычитанием.
+        text_angle_deg = math.degrees(math.atan2(dir_[1], dir_[0]))
+        text_angle_deg -= math.degrees(self.rotation)
+        # Нормализуем в диапазон (-90, 90], чтобы текст не был перевёрнут.
+        while text_angle_deg > 90:
+            text_angle_deg -= 180
+        while text_angle_deg <= -90:
+            text_angle_deg += 180
+
+        self.canvas.create_text(sxt, syt, text=dim.label(),
+                                 fill=text_color,
+                                 font=("Arial", font_size),
+                                 angle=text_angle_deg,
+                                 tags="primitive")
+        if selected:
+            for pt in (p1, p2, e1, e2, dim.dim_pos):
+                self._draw_ctrl_point(*self._scr(pt))
+
+    def _draw_dim_radial(self, dim, color, text_color, dim_style, selected):
+        g = dim.geometry()
+        cx, cy = g['center']
+        on_circle = g['on_circle']
+        opp = g['opposite']
+        text_pos = g['text_pos'] or on_circle
+        kind = g['kind']
+
+        # Размерная линия
+        if kind == RadialDimension.KIND_DIAMETER:
+            # Диаметр: линия через центр от opp к on_circle
+            sx1, sy1 = self._scr(opp)
+            sx2, sy2 = self._scr(on_circle)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   dim_style, color, tags="primitive")
+            # Стрелки на обоих концах, направлены наружу
+            d1 = (on_circle[0]-cx, on_circle[1]-cy)
+            l1 = math.hypot(*d1) or 1
+            self._draw_dim_arrow(on_circle, (d1[0]/l1, d1[1]/l1),
+                                  dim.arrow_size, color, dim.arrow_filled)
+            d2 = (opp[0]-cx, opp[1]-cy)
+            l2 = math.hypot(*d2) or 1
+            self._draw_dim_arrow(opp, (d2[0]/l2, d2[1]/l2),
+                                  dim.arrow_size, color, dim.arrow_filled)
+        else:
+            # Радиус: от центра к точке на окружности
+            sx1, sy1 = self._scr((cx, cy))
+            sx2, sy2 = self._scr(on_circle)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   dim_style, color, tags="primitive")
+            d1 = (on_circle[0]-cx, on_circle[1]-cy)
+            l1 = math.hypot(*d1) or 1
+            self._draw_dim_arrow(on_circle, (d1[0]/l1, d1[1]/l1),
+                                  dim.arrow_size, color, dim.arrow_filled)
+
+        # Линия-выноска от on_circle до text_pos (если text_pos снаружи)
+        d_text_to_center = math.hypot(text_pos[0]-cx, text_pos[1]-cy)
+        text_outside = d_text_to_center > dim.r * 1.05
+        if text_outside:
+            sx1, sy1 = self._scr(on_circle)
+            sx2, sy2 = self._scr(text_pos)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   dim_style, color, tags="primitive")
+
+        font_size = max(8, int(dim.text_height * self.scale * self.grid_step * 0.9))
+        label = dim.label()
+        with_shelf = bool(getattr(dim, 'with_shelf', False)) and text_outside
+
+        if with_shelf:
+            # Полка: горизонтальный отрезок в направлении от центра к text_pos.
+            # Длина полки ≈ ширина надписи в мировых единицах.
+            shelf_len = max(len(label) * dim.text_height * 0.7,
+                            dim.text_height * 2.0)
+            sign = 1.0 if text_pos[0] >= cx else -1.0
+            shelf_end = (text_pos[0] + sign * shelf_len, text_pos[1])
+            sx1, sy1 = self._scr(text_pos)
+            sx2, sy2 = self._scr(shelf_end)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   dim_style, color, tags="primitive")
+            # Текст по центру полки, над ней
+            tx = (text_pos[0] + shelf_end[0]) / 2.0
+            sxt, syt = self._scr((tx, text_pos[1]))
+            self.canvas.create_text(sxt, syt - font_size * 0.7,
+                                     text=label, fill=text_color,
+                                     font=("Arial", font_size),
+                                     tags="primitive")
+        else:
+            sxt, syt = self._scr(text_pos)
+            self.canvas.create_text(sxt, syt - font_size - 2, text=label,
+                                     fill=text_color,
+                                     font=("Arial", font_size),
+                                     tags="primitive")
+        if selected:
+            self._draw_ctrl_point(*self._scr((cx, cy)))
+            self._draw_ctrl_point(*self._scr(on_circle))
+            self._draw_ctrl_point(*self._scr(text_pos))
+
+    def _draw_dim_angular(self, dim, color, text_color, dim_style, selected):
+        g = dim.geometry()
+        v = g['vertex']
+        a1, a2 = g['a1'], g['a2']
+        mid = g['mid']
+        R = g['arc_radius']
+        p1, p2 = g['p1'], g['p2']
+
+        # Выносные линии — продолжаем лучи vertex→p1 и vertex→p2 до радиуса R
+        for ray_pt in (p1, p2):
+            dx = ray_pt[0] - v[0]
+            dy = ray_pt[1] - v[1]
+            l = math.hypot(dx, dy) or 1
+            ux, uy = dx/l, dy/l
+            arc_end  = (v[0] + ux * (R + dim.ext_overshoot),
+                         v[1] + uy * (R + dim.ext_overshoot))
+            # выносная начинается чуть дальше геометрической точки
+            ext_start = (v[0] + ux * (l + dim.ext_offset),
+                          v[1] + uy * (l + dim.ext_offset))
+            sx1, sy1 = self._scr(ext_start)
+            sx2, sy2 = self._scr(arc_end)
+            self.draw_styled_line(self.canvas, sx1, sy1, sx2, sy2,
+                                   dim_style, color, tags="primitive")
+
+        # Размерная дуга: интерполируем по углам от a1 до a2 в направлении sign
+        steps = 48
+        d = a2 - a1
+        while d > math.pi: d -= 2*math.pi
+        while d < -math.pi: d += 2*math.pi
+        screen_pts = []
+        for i in range(steps + 1):
+            t = i / steps
+            a = a1 + d * t
+            wp = (v[0] + R * math.cos(a), v[1] + R * math.sin(a))
+            sxx, syy = self._scr(wp)
+            screen_pts.extend([sxx, syy])
+        if len(screen_pts) >= 4:
+            self.canvas.create_line(*screen_pts, fill=color,
+                                     width=dim_style.get('width', 1.0),
+                                     tags="primitive")
+
+        # Стрелки на концах дуги — касательно к дуге
+        end1 = (v[0] + R * math.cos(a1), v[1] + R * math.sin(a1))
+        end2 = (v[0] + R * math.cos(a2), v[1] + R * math.sin(a2))
+        # Касательная: перпендикуляр к радиусу, в направлении дуги
+        s = 1.0 if d >= 0 else -1.0
+        tan1 = (-math.sin(a1) * s, math.cos(a1) * s)
+        tan2 = ( math.sin(a2) * s, -math.cos(a2) * s)
+        # Стрелки направлены вдоль дуги наружу из угловой меры
+        self._draw_dim_arrow(end1, (-tan1[0], -tan1[1]),
+                              dim.arrow_size, color, dim.arrow_filled)
+        self._draw_dim_arrow(end2, (-tan2[0], -tan2[1]),
+                              dim.arrow_size, color, dim.arrow_filled)
+
+        # Текст в середине дуги, параллельно касательной к дуге (ЕСКД).
+        text_offset = dim.text_height * 0.7
+        mid_pt = (v[0] + (R + text_offset) * math.cos(mid),
+                   v[1] + (R + text_offset) * math.sin(mid))
+        sxt, syt = self._scr(mid_pt)
+        font_size = max(8, int(dim.text_height * self.scale * self.grid_step * 0.9))
+        # Касательная к дуге в точке mid: перпендикуляр к радиусу
+        tan_angle = math.degrees(mid) + 90.0
+        tan_angle -= math.degrees(self.rotation)
+        while tan_angle > 90:
+            tan_angle -= 180
+        while tan_angle <= -90:
+            tan_angle += 180
+        self.canvas.create_text(sxt, syt, text=dim.label(),
+                                 fill=text_color,
+                                 font=("Arial", font_size),
+                                 angle=tan_angle,
+                                 tags="primitive")
+        if selected:
+            # Грипперы: ВЕРШИНА, концы лучей P1/P2, плюс точка управления радиусом дуги
+            self._draw_ctrl_point(*self._scr(v))
+            self._draw_ctrl_point(*self._scr(p1))
+            self._draw_ctrl_point(*self._scr(p2))
+            arc_mid_pt = (v[0] + R * math.cos(mid), v[1] + R * math.sin(mid))
+            self._draw_ctrl_point(*self._scr(arc_mid_pt))
+
     def _draw_ctrl_point(self, x, y, r=5):
         self.canvas.create_rectangle(x-r, y-r, x+r, y+r, fill="#00AAFF", outline="#0044AA", width=1, tags="primitive")
 
@@ -2381,6 +3258,7 @@ class SegmentApp:
             'segment_mouse': '📏', 'polyline': '〰', 'circle': '⭕',
             'arc': '🌙', 'rect': '▭', 'ellipse': '⬭',
             'polygon': '⬡', 'spline': '〜',
+            'dim_linear': '↔', 'dim_radial': '⌀', 'dim_angular': '∠',
         }
         for prim in self.primitives:
             icon = icons.get(prim['type'], '•')
@@ -2484,6 +3362,26 @@ class SegmentApp:
                 min_d = min(min_d, d)
             return min_d
         
+        elif t == 'dim_linear':
+            try:
+                dim = make_dimension(t, p)
+                e1 = dim.project(dim.p1)
+                e2 = dim.project(dim.p2)
+                return self._point_segment_dist(wx, wy, e1[0], e1[1], e2[0], e2[1])
+            except Exception:
+                return float('inf')
+
+        elif t == 'dim_radial':
+            cx, cy = p['cx'], p['cy']
+            text_pos = p.get('text_pos') or (cx + p['r'], cy)
+            return self._point_segment_dist(wx, wy, cx, cy, text_pos[0], text_pos[1])
+
+        elif t == 'dim_angular':
+            v = p['vertex']
+            R = p['arc_radius']
+            d = abs(math.hypot(wx - v[0], wy - v[1]) - R)
+            return d
+
         elif t == 'spline':
             pts = p['points']
             min_d = float('inf')
@@ -2493,6 +3391,195 @@ class SegmentApp:
             return min_d
         
         return float('inf')
+
+    # ====================================================================
+    #          Грипперы (контрольные точки) для редактирования
+    # ====================================================================
+    def _get_grippers(self, prim):
+        """Список контрольных точек примитива: [{'key': str, 'pt': (wx, wy)}, ...]"""
+        t = prim['type']; p = prim['params']
+        if t == 'segment_mouse':
+            return [{'key': 'p1', 'pt': p['p1']}, {'key': 'p2', 'pt': p['p2']}]
+        if t == 'polyline':
+            return [{'key': f'pt{i}', 'pt': pt} for i, pt in enumerate(p['points'])]
+        if t == 'circle':
+            return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
+                    {'key': 'edge',   'pt': (p['cx'] + p['r'], p['cy'])}]
+        if t == 'arc':
+            a1 = math.radians(p['start_angle'])
+            a2 = math.radians(p['end_angle'])
+            return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
+                    {'key': 'start',  'pt': (p['cx'] + p['r']*math.cos(a1),
+                                              p['cy'] + p['r']*math.sin(a1))},
+                    {'key': 'end',    'pt': (p['cx'] + p['r']*math.cos(a2),
+                                              p['cy'] + p['r']*math.sin(a2))}]
+        if t == 'rect':
+            return [{'key': f'corner{i}', 'pt': pt} for i, pt in enumerate(p['points'])]
+        if t == 'ellipse':
+            ar = math.radians(p.get('angle', 0))
+            return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
+                    {'key': 'rx',     'pt': (p['cx'] + p['rx']*math.cos(ar),
+                                              p['cy'] + p['rx']*math.sin(ar))},
+                    {'key': 'ry',     'pt': (p['cx'] - p['ry']*math.sin(ar),
+                                              p['cy'] + p['ry']*math.cos(ar))}]
+        if t == 'polygon':
+            return [{'key': 'center', 'pt': (p['cx'], p['cy'])},
+                    {'key': 'vertex', 'pt': p['vertices'][0]}]
+        if t == 'spline':
+            return [{'key': f'pt{i}', 'pt': pt} for i, pt in enumerate(p['points'])]
+        if t == 'dim_linear':
+            return [{'key': 'p1',      'pt': p['p1']},
+                    {'key': 'p2',      'pt': p['p2']},
+                    {'key': 'dim_pos', 'pt': p['dim_pos']}]
+        if t == 'dim_radial':
+            a = math.radians(p['angle_deg'])
+            on_circle = (p['cx'] + p['r']*math.cos(a),
+                         p['cy'] + p['r']*math.sin(a))
+            text_pos = p.get('text_pos') or on_circle
+            return [{'key': 'center',    'pt': (p['cx'], p['cy'])},
+                    {'key': 'on_circle', 'pt': on_circle},
+                    {'key': 'text_pos',  'pt': text_pos}]
+        if t == 'dim_angular':
+            v = p['vertex']
+            R = p.get('arc_radius', 1.0)
+            a1 = math.atan2(p['p1'][1]-v[1], p['p1'][0]-v[0])
+            a2 = math.atan2(p['p2'][1]-v[1], p['p2'][0]-v[0])
+            d = a2 - a1
+            while d >  math.pi: d -= 2*math.pi
+            while d < -math.pi: d += 2*math.pi
+            mid = a1 + d/2
+            arc_mid_pt = (v[0] + R*math.cos(mid), v[1] + R*math.sin(mid))
+            return [{'key': 'vertex',   'pt': v},
+                    {'key': 'p1',       'pt': p['p1']},
+                    {'key': 'p2',       'pt': p['p2']},
+                    {'key': 'arc_mid',  'pt': arc_mid_pt}]
+        return []
+
+    def _hit_grip(self, sx, sy, hit_radius=8):
+        """Проверяет, попадает ли клик (sx,sy) в гриппер активного примитива."""
+        if self.selected_prim_idx is None:
+            return None
+        if self.selected_prim_idx >= len(self.primitives):
+            return None
+        prim = self.primitives[self.selected_prim_idx]
+        for g in self._get_grippers(prim):
+            gx, gy = self.world_to_screen(*g['pt'])
+            if math.hypot(gx - sx, gy - sy) <= hit_radius:
+                return {'idx': self.selected_prim_idx, 'key': g['key']}
+        return None
+
+    def _move_gripper(self, prim, key, new_pt):
+        """Перемещение гриппера → обновление параметров примитива."""
+        t = prim['type']; p = prim['params']
+
+        if t == 'segment_mouse':
+            if key in ('p1', 'p2'):
+                p[key] = tuple(new_pt)
+
+        elif t == 'polyline':
+            if key.startswith('pt'):
+                idx = int(key[2:])
+                if 0 <= idx < len(p['points']):
+                    p['points'][idx] = tuple(new_pt)
+
+        elif t == 'circle':
+            if key == 'center':
+                p['cx'], p['cy'] = new_pt
+            elif key == 'edge':
+                p['r'] = math.hypot(new_pt[0]-p['cx'], new_pt[1]-p['cy'])
+
+        elif t == 'arc':
+            if key == 'center':
+                p['cx'], p['cy'] = new_pt
+            elif key == 'start':
+                p['start_angle'] = math.degrees(math.atan2(new_pt[1]-p['cy'],
+                                                            new_pt[0]-p['cx']))
+                p['r'] = math.hypot(new_pt[0]-p['cx'], new_pt[1]-p['cy'])
+            elif key == 'end':
+                p['end_angle'] = math.degrees(math.atan2(new_pt[1]-p['cy'],
+                                                          new_pt[0]-p['cx']))
+
+        elif t == 'rect':
+            if key.startswith('corner'):
+                idx = int(key[6:])
+                opp_idx = (idx + 2) % 4
+                opp = p['points'][opp_idx]
+                xs = [new_pt[0], opp[0]]
+                ys = [new_pt[1], opp[1]]
+                # axis-aligned восстановление: сохраняем порядок углов
+                p['points'] = [(xs[0], ys[0]), (xs[1], ys[0]),
+                               (xs[1], ys[1]), (xs[0], ys[1])]
+
+        elif t == 'ellipse':
+            if key == 'center':
+                p['cx'], p['cy'] = new_pt
+            elif key == 'rx':
+                dx = new_pt[0]-p['cx']; dy = new_pt[1]-p['cy']
+                p['rx'] = math.hypot(dx, dy)
+                p['angle'] = math.degrees(math.atan2(dy, dx))
+            elif key == 'ry':
+                dx = new_pt[0]-p['cx']; dy = new_pt[1]-p['cy']
+                p['ry'] = math.hypot(dx, dy)
+
+        elif t == 'polygon':
+            if key == 'center':
+                dx = new_pt[0] - p['cx']
+                dy = new_pt[1] - p['cy']
+                p['cx'], p['cy'] = new_pt
+                p['vertices'] = [(v[0]+dx, v[1]+dy) for v in p['vertices']]
+            elif key == 'vertex':
+                dx = new_pt[0]-p['cx']; dy = new_pt[1]-p['cy']
+                r = math.hypot(dx, dy)
+                p['r'] = r
+                n = p['n']
+                base = math.degrees(math.atan2(dy, dx))
+                p['rotation_angle'] = base - p.get('base_angle', 0)
+                verts = []
+                for i in range(n):
+                    a = math.radians(base + i*360/n)
+                    verts.append((p['cx']+r*math.cos(a), p['cy']+r*math.sin(a)))
+                p['vertices'] = verts
+
+        elif t == 'spline':
+            if key.startswith('pt'):
+                idx = int(key[2:])
+                if 0 <= idx < len(p['points']):
+                    p['points'][idx] = tuple(new_pt)
+
+        elif t == 'dim_linear':
+            if key in ('p1', 'p2', 'dim_pos'):
+                p[key] = tuple(new_pt)
+                # Ручное перемещение → разорвать ассоциативную ссылку для этой точки
+                p['assoc'] = [a for a in p.get('assoc', [])
+                              if a.get('point_key') != key]
+
+        elif t == 'dim_radial':
+            if key == 'center':
+                p['cx'], p['cy'] = new_pt
+                p['assoc'] = []
+            elif key == 'on_circle':
+                dx = new_pt[0]-p['cx']; dy = new_pt[1]-p['cy']
+                p['angle_deg'] = math.degrees(math.atan2(dy, dx))
+                # если нет ассоциативной ссылки на окружность — обновляем r
+                has_circle_ref = any(a.get('point_key') == 'circle'
+                                     for a in p.get('assoc', []))
+                if not has_circle_ref:
+                    p['r'] = math.hypot(dx, dy)
+            elif key == 'text_pos':
+                p['text_pos'] = tuple(new_pt)
+                # Также обновляем угол: радиальная линия идёт от центра к тексту
+                dx = new_pt[0]-p['cx']; dy = new_pt[1]-p['cy']
+                p['angle_deg'] = math.degrees(math.atan2(dy, dx))
+
+        elif t == 'dim_angular':
+            if key in ('vertex', 'p1', 'p2'):
+                p[key] = tuple(new_pt)
+                p['assoc'] = [a for a in p.get('assoc', [])
+                              if a.get('point_key') != key]
+            elif key == 'arc_mid':
+                v = p['vertex']
+                p['arc_radius'] = max(1e-6,
+                                       math.hypot(new_pt[0]-v[0], new_pt[1]-v[1]))
 
     def _point_segment_dist(self, px, py, ax, ay, bx, by):
         dx, dy = bx-ax, by-ay
@@ -2538,6 +3625,8 @@ class SegmentApp:
             elif t == 'polygon':
                 p['params']['cx'] += 0.5; p['params']['cy'] += 0.5
                 p['params']['vertices'] = [(x+0.5, y+0.5) for x,y in p['params']['vertices']]
+            p['id'] = self._next_prim_id
+            self._next_prim_id += 1
             self.primitives.append(p)
             self.update_prims_list()
             self.redraw_all()
@@ -2668,6 +3757,59 @@ class SegmentApp:
             tk.Button(self.prim_props_inner, text="-Точка", command=self.spline_remove_point).grid(row=row, column=1, sticky=tk.EW)
             row += 1
 
+        elif is_dimension_type(t):
+            # --- Общие свойства размеров ---
+            try:
+                dim = make_dimension(t, p)
+                value_text = f"{dim.measure():.{p.get('precision', 2)}f}"
+            except Exception:
+                value_text = "?"
+            tk.Label(self.prim_props_inner, text="Значение:", bg="#162030", fg="#5A7A98", font=("Consolas", 8)).grid(row=row, column=0, sticky=tk.W)
+            tk.Label(self.prim_props_inner, text=value_text, bg="#162030", fg="#00FF88", font=("Consolas", 9, "bold")).grid(row=row, column=1, sticky=tk.W)
+            row += 1
+
+            def add_entry(label, key, val, width=12):
+                nonlocal row
+                tk.Label(self.prim_props_inner, text=label, bg="#162030", fg="#5A7A98", font=("Consolas", 8)).grid(row=row, column=0, sticky=tk.W)
+                var = tk.StringVar(value=str(val) if val is not None else "")
+                tk.Entry(self.prim_props_inner, textvariable=var, width=width, bg="#0A1520", fg="#00D4FF", insertbackground="#00D4FF", relief="flat", font=("Consolas", 8), highlightthickness=1, highlightbackground="#1E3050", highlightcolor="#00D4FF").grid(row=row, column=1, columnspan=2, sticky=tk.EW)
+                self.prim_prop_vars[key] = var
+                row += 1
+
+            add_entry("Текст (override):", 'text_override', p.get('text_override') or "")
+            add_entry("Высота шрифта:",     'text_height',   f"{p.get('text_height', 0.35):.3f}")
+            add_entry("Размер стрелки:",    'arrow_size',    f"{p.get('arrow_size', 0.30):.3f}")
+            add_entry("Выход выносной:",    'ext_overshoot', f"{p.get('ext_overshoot', 0.15):.3f}")
+            add_entry("Зазор выносной:",    'ext_offset',    f"{p.get('ext_offset', 0.05):.3f}")
+            add_entry("Точность (знаки):",  'precision',     f"{int(p.get('precision', 2))}")
+
+            if t == 'dim_linear':
+                tk.Label(self.prim_props_inner, text="Ориентация:", bg="#162030", fg="#5A7A98", font=("Consolas", 8)).grid(row=row, column=0, sticky=tk.W)
+                ori_var = tk.StringVar(value=p.get('orientation', 'aligned'))
+                ttk.Combobox(self.prim_props_inner, textvariable=ori_var,
+                             values=['aligned', 'horizontal', 'vertical'],
+                             state='readonly', width=12).grid(row=row, column=1, sticky=tk.EW)
+                self.prim_prop_vars['orientation'] = ori_var
+                row += 1
+            elif t == 'dim_radial':
+                tk.Label(self.prim_props_inner, text="Тип:", bg="#162030", fg="#5A7A98", font=("Consolas", 8)).grid(row=row, column=0, sticky=tk.W)
+                kind_var = tk.StringVar(value=p.get('kind', 'radius'))
+                ttk.Combobox(self.prim_props_inner, textvariable=kind_var,
+                             values=['radius', 'diameter'],
+                             state='readonly', width=12).grid(row=row, column=1, sticky=tk.EW)
+                self.prim_prop_vars['kind'] = kind_var
+                row += 1
+                add_entry("Угол радиуса (°):", 'angle_deg', f"{p.get('angle_deg', 0.0):.2f}")
+                shelf_var = tk.BooleanVar(value=bool(p.get('with_shelf', False)))
+                tk.Checkbutton(self.prim_props_inner, text="Полка-выноска",
+                               variable=shelf_var, bg="#162030", fg="#C8D8E8",
+                               selectcolor="#003D5C", activebackground="#1E3A55",
+                               font=("Consolas", 8)).grid(row=row, columnspan=2, sticky=tk.W)
+                self.prim_prop_vars['with_shelf'] = shelf_var
+                row += 1
+            elif t == 'dim_angular':
+                add_entry("Радиус дуги:", 'arc_radius', f"{p.get('arc_radius', 1.0):.3f}")
+
     def apply_prim_props(self):
         if self.selected_prim_idx is None:
             messagebox.showwarning("Нет выбора", "Сначала выберите примитив из списка.")
@@ -2761,7 +3903,28 @@ class SegmentApp:
                     y = float(v[f'sy{i}'].get())
                     new_pts.append((x, y))
                 p['points'] = new_pts
-            
+
+            elif is_dimension_type(t):
+                # Общие параметры
+                ov = v.get('text_override').get().strip()
+                p['text_override']  = ov if ov else None
+                p['text_height']    = float(v['text_height'].get())
+                p['arrow_size']     = float(v['arrow_size'].get())
+                p['ext_overshoot']  = float(v['ext_overshoot'].get())
+                p['ext_offset']     = float(v['ext_offset'].get())
+                p['precision']      = int(float(v['precision'].get()))
+                if t == 'dim_linear' and 'orientation' in v:
+                    p['orientation'] = v['orientation'].get()
+                elif t == 'dim_radial':
+                    if 'kind' in v:
+                        p['kind'] = v['kind'].get()
+                    if 'angle_deg' in v:
+                        p['angle_deg'] = float(v['angle_deg'].get())
+                    if 'with_shelf' in v:
+                        p['with_shelf'] = bool(v['with_shelf'].get())
+                elif t == 'dim_angular' and 'arc_radius' in v:
+                    p['arc_radius'] = float(v['arc_radius'].get())
+
             self._sync_segments_from_primitives()
             self.update_prims_list()
             self.update_segments_list()
@@ -2853,7 +4016,18 @@ class SegmentApp:
                 all_points += p['vertices']
             elif t == 'spline':
                 all_points += p['points']
-        
+            elif t == 'dim_linear':
+                all_points += [p.get('p1', (0,0)), p.get('p2', (0,0)), p.get('dim_pos', (0,0))]
+            elif t == 'dim_radial':
+                cx, cy, r = p['cx'], p['cy'], p['r']
+                all_points += [(cx-r, cy-r), (cx+r, cy+r)]
+                if p.get('text_pos'):
+                    all_points.append(p['text_pos'])
+            elif t == 'dim_angular':
+                v = p['vertex']
+                R = p['arc_radius']
+                all_points += [(v[0]-R, v[1]-R), (v[0]+R, v[1]+R)]
+
         if not all_points:
             self.reset_view()
             return

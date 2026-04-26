@@ -25,6 +25,16 @@ AutoCAD, nanoCAD, КОМПАС-3D, LibreCAD, QCAD, FreeCAD, BricsCAD.
 
 import math
 import os
+import json
+
+from dimensions import (LinearDimension, RadialDimension, AngularDimension,
+                        make_dimension, is_dimension_type, arrow_polygon)
+
+
+# Имя слоя, на который выгружается «развёрнутая» геометрия размеров.
+# Имя выбрано читаемым, чтобы пользователь мог его быстро найти/спрятать
+# в любой CAD-программе.
+DIMENSIONS_LAYER = 'Размеры'
 
 
 # --- Стандартная палитра AutoCAD ACI (выборка широко используемых цветов).
@@ -284,6 +294,22 @@ def _write_tables(out, layers):
         _tag(out, 6,  info['ltype'])
     _tag(out, 0, 'ENDTAB')
 
+    # --- STYLE (текстовый стиль для TEXT-сущностей надписей размеров)
+    _tag(out, 0, 'TABLE')
+    _tag(out, 2, 'STYLE')
+    _tag(out, 70, 1)
+    _tag(out, 0, 'STYLE')
+    _tag(out, 2, 'STANDARD')
+    _tag(out, 70, 0)
+    _tag(out, 40, 0.0)        # фиксированная высота (0 — берётся из TEXT)
+    _tag(out, 41, 1.0)        # коэффициент ширины
+    _tag(out, 50, 0.0)        # наклон
+    _tag(out, 71, 0)          # генерация
+    _tag(out, 42, 2.5)        # последняя использованная высота
+    _tag(out, 3, 'txt')       # имя файла шрифта
+    _tag(out, 4, '')          # большой шрифт
+    _tag(out, 0, 'ENDTAB')
+
     _section_end(out)
 
 
@@ -344,6 +370,39 @@ def _emit_arc(out, layer, color, cx, cy, r, start_deg, end_deg):
     _tag(out, 51, float(end_deg) % 360.0)
 
 
+def _emit_text(out, layer, color, x, y, height, text, rotation_deg=0.0,
+               halign=1, valign=2):
+    """TEXT-сущность DXF R12. halign=1 (centered), valign=2 (middle)."""
+    _emit_common(out, 'TEXT', layer, color)
+    _tag(out, 7, 'STANDARD')
+    _tag(out, 10, float(x))
+    _tag(out, 20, float(y))
+    _tag(out, 30, 0.0)
+    _tag(out, 40, float(height))
+    _tag(out, 1,  str(text))
+    if abs(rotation_deg) > 1e-9:
+        _tag(out, 50, float(rotation_deg) % 360.0)
+    _tag(out, 41, 1.0)
+    _tag(out, 51, 0.0)
+    _tag(out, 71, 0)
+    _tag(out, 72, int(halign))
+    _tag(out, 11, float(x))     # alignment point (используется при halign>0)
+    _tag(out, 21, float(y))
+    _tag(out, 31, 0.0)
+    _tag(out, 73, int(valign))
+
+
+def _emit_solid_triangle(out, layer, color, p1, p2, p3):
+    """Закрашенный треугольник через SOLID (R12). Поддерживается всеми CAD."""
+    _emit_common(out, 'SOLID', layer, color)
+    # Внимание: SOLID ожидает 4 точки в zigzag-порядке (10,11,12,13);
+    # для треугольника четвёртая точка = третья.
+    _tag(out, 10, float(p1[0])); _tag(out, 20, float(p1[1])); _tag(out, 30, 0.0)
+    _tag(out, 11, float(p2[0])); _tag(out, 21, float(p2[1])); _tag(out, 31, 0.0)
+    _tag(out, 12, float(p3[0])); _tag(out, 22, float(p3[1])); _tag(out, 32, 0.0)
+    _tag(out, 13, float(p3[0])); _tag(out, 23, float(p3[1])); _tag(out, 33, 0.0)
+
+
 def _emit_polyline(out, layer, color, points, closed=False):
     """R12 POLYLINE + последовательность VERTEX + SEQEND."""
     if len(points) < 2:
@@ -370,6 +429,189 @@ def _emit_polyline(out, layer, color, points, closed=False):
 # ----------------------------------------------------------------------
 # Преобразование одного примитива внутренней модели в сущности DXF.
 # ----------------------------------------------------------------------
+
+def _emit_dim_arrow(out, layer, color, tip, direction, size, filled=True):
+    tri = arrow_polygon(tip, direction, size)
+    if filled:
+        _emit_solid_triangle(out, layer, color, tri[0], tri[1], tri[2])
+    else:
+        _emit_polyline(out, layer, color,
+                        [tri[0], tri[1], tri[2]], closed=True)
+
+
+def _readable_text_angle(angle_deg):
+    """Нормализует угол поворота текста в (-90, 90] чтобы текст не был перевёрнут."""
+    while angle_deg > 90.0:
+        angle_deg -= 180.0
+    while angle_deg <= -90.0:
+        angle_deg += 180.0
+    return angle_deg
+
+
+def _emit_dim_linear(out, dim, layer, color):
+    g = dim.geometry()
+    e1, e2 = g['e1'], g['e2']
+    p1, p2 = g['p1'], g['p2']
+    nrm = g['normal']
+
+    L = math.hypot(e2[0]-e1[0], e2[1]-e1[1])
+    if L < 1e-9:
+        return
+    dir_ = ((e2[0]-e1[0])/L, (e2[1]-e1[1])/L)
+
+    # 1) Выносные линии
+    for src, foot in ((p1, e1), (p2, e2)):
+        vx = foot[0] - src[0]
+        vy = foot[1] - src[1]
+        vl = math.hypot(vx, vy)
+        if vl < 1e-9:
+            vx, vy = nrm; vl = 1.0
+        ux, uy = vx/vl, vy/vl
+        start = (src[0] + ux*dim.ext_offset, src[1] + uy*dim.ext_offset)
+        end   = (foot[0] + ux*dim.ext_overshoot, foot[1] + uy*dim.ext_overshoot)
+        _emit_line(out, layer, color, start[0], start[1], end[0], end[1])
+
+    # 2) Размерная линия
+    ext = dim.dim_extension
+    d1 = (e1[0] - dir_[0]*ext, e1[1] - dir_[1]*ext)
+    d2 = (e2[0] + dir_[0]*ext, e2[1] + dir_[1]*ext)
+    _emit_line(out, layer, color, d1[0], d1[1], d2[0], d2[1])
+
+    # 3) Стрелки
+    _emit_dim_arrow(out, layer, color, e1,
+                     (-dir_[0], -dir_[1]), dim.arrow_size, dim.arrow_filled)
+    _emit_dim_arrow(out, layer, color, e2,
+                     dir_, dim.arrow_size, dim.arrow_filled)
+
+    # 4) Текст (над размерной линией, со стороны, противоположной геометрии)
+    mid = ((e1[0]+e2[0])/2.0, (e1[1]+e2[1])/2.0)
+    avg_geom = ((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
+    side = (avg_geom[0]-mid[0])*nrm[0] + (avg_geom[1]-mid[1])*nrm[1]
+    text_nrm = nrm if side < 0 else (-nrm[0], -nrm[1])
+    offset = dim.text_height * 0.7
+    tx = mid[0] + text_nrm[0]*offset
+    ty = mid[1] + text_nrm[1]*offset
+    # Текст ПАРАЛЛЕЛЬНО размерной линии (ЕСКД ГОСТ 2.307-2011 п.4.6).
+    # В DXF Y направлена вверх (как в нашем мире), нормализуем угол в (-90,90].
+    angle = _readable_text_angle(math.degrees(math.atan2(dir_[1], dir_[0])))
+    _emit_text(out, layer, color, tx, ty, dim.text_height,
+                dim.label(), rotation_deg=angle)
+
+
+def _emit_dim_radial(out, dim, layer, color):
+    g = dim.geometry()
+    cx, cy = g['center']
+    on_circle = g['on_circle']
+    opp = g['opposite']
+    text_pos = g['text_pos'] or on_circle
+    kind = g['kind']
+
+    # Размерная линия + стрелки
+    if kind == RadialDimension.KIND_DIAMETER:
+        _emit_line(out, layer, color, opp[0], opp[1], on_circle[0], on_circle[1])
+        d1 = (on_circle[0]-cx, on_circle[1]-cy)
+        l1 = math.hypot(*d1) or 1.0
+        _emit_dim_arrow(out, layer, color, on_circle,
+                         (d1[0]/l1, d1[1]/l1), dim.arrow_size, dim.arrow_filled)
+        d2 = (opp[0]-cx, opp[1]-cy)
+        l2 = math.hypot(*d2) or 1.0
+        _emit_dim_arrow(out, layer, color, opp,
+                         (d2[0]/l2, d2[1]/l2), dim.arrow_size, dim.arrow_filled)
+    else:
+        _emit_line(out, layer, color, cx, cy, on_circle[0], on_circle[1])
+        d1 = (on_circle[0]-cx, on_circle[1]-cy)
+        l1 = math.hypot(*d1) or 1.0
+        _emit_dim_arrow(out, layer, color, on_circle,
+                         (d1[0]/l1, d1[1]/l1), dim.arrow_size, dim.arrow_filled)
+
+    # Линия-выноска до позиции текста
+    d_text_to_center = math.hypot(text_pos[0]-cx, text_pos[1]-cy)
+    text_outside = d_text_to_center > dim.r * 1.05
+    if text_outside:
+        _emit_line(out, layer, color,
+                    on_circle[0], on_circle[1], text_pos[0], text_pos[1])
+
+    label = dim.label()
+    with_shelf = bool(getattr(dim, 'with_shelf', False)) and text_outside
+    if with_shelf:
+        shelf_len = max(len(label) * dim.text_height * 0.7,
+                         dim.text_height * 2.0)
+        sign = 1.0 if text_pos[0] >= cx else -1.0
+        shelf_end = (text_pos[0] + sign*shelf_len, text_pos[1])
+        _emit_line(out, layer, color,
+                    text_pos[0], text_pos[1], shelf_end[0], shelf_end[1])
+        tx = (text_pos[0] + shelf_end[0]) / 2.0
+        ty = text_pos[1] + dim.text_height * 0.5
+        _emit_text(out, layer, color, tx, ty, dim.text_height,
+                    label, rotation_deg=0.0)
+    else:
+        tx, ty = text_pos[0], text_pos[1] + dim.text_height
+        _emit_text(out, layer, color, tx, ty, dim.text_height,
+                    label, rotation_deg=0.0)
+
+
+def _emit_dim_angular(out, dim, layer, color):
+    g = dim.geometry()
+    v = g['vertex']
+    a1, a2 = g['a1'], g['a2']
+    R = g['arc_radius']
+    p1, p2 = g['p1'], g['p2']
+
+    # Выносные лучи
+    for ray_pt in (p1, p2):
+        dx = ray_pt[0]-v[0]; dy = ray_pt[1]-v[1]
+        l = math.hypot(dx, dy) or 1.0
+        ux, uy = dx/l, dy/l
+        ext_start = (v[0] + ux*(l + dim.ext_offset),
+                      v[1] + uy*(l + dim.ext_offset))
+        arc_end   = (v[0] + ux*(R + dim.ext_overshoot),
+                      v[1] + uy*(R + dim.ext_overshoot))
+        _emit_line(out, layer, color,
+                    ext_start[0], ext_start[1], arc_end[0], arc_end[1])
+
+    # Размерная дуга — DXF ARC всегда CCW от start к end
+    d = a2 - a1
+    while d >  math.pi: d -= 2*math.pi
+    while d < -math.pi: d += 2*math.pi
+    if d >= 0:
+        start_deg, end_deg = math.degrees(a1), math.degrees(a2)
+    else:
+        start_deg, end_deg = math.degrees(a2), math.degrees(a1)
+    _emit_arc(out, layer, color, v[0], v[1], R, start_deg, end_deg)
+
+    # Стрелки касательно к дуге
+    end1 = (v[0] + R*math.cos(a1), v[1] + R*math.sin(a1))
+    end2 = (v[0] + R*math.cos(a2), v[1] + R*math.sin(a2))
+    s = 1.0 if d >= 0 else -1.0
+    tan1 = (-math.sin(a1)*s,  math.cos(a1)*s)
+    tan2 = ( math.sin(a2)*s, -math.cos(a2)*s)
+    _emit_dim_arrow(out, layer, color, end1,
+                     (-tan1[0], -tan1[1]), dim.arrow_size, dim.arrow_filled)
+    _emit_dim_arrow(out, layer, color, end2,
+                     (-tan2[0], -tan2[1]), dim.arrow_size, dim.arrow_filled)
+
+    # Текст по середине дуги, ПАРАЛЛЕЛЬНО касательной (ЕСКД).
+    mid = a1 + d/2.0
+    tx = v[0] + (R + dim.text_height*0.7)*math.cos(mid)
+    ty = v[1] + (R + dim.text_height*0.7)*math.sin(mid)
+    tan_deg = _readable_text_angle(math.degrees(mid) + 90.0)
+    _emit_text(out, layer, color, tx, ty, dim.text_height,
+                dim.label(), rotation_deg=tan_deg)
+
+
+def _emit_dimension(out, prim, layer, color):
+    """Развёртывает размер в стандартные DXF-сущности (LINE/ARC/SOLID/TEXT)."""
+    try:
+        dim = make_dimension(prim['type'], prim['params'])
+    except Exception:
+        return
+    if isinstance(dim, LinearDimension):
+        _emit_dim_linear(out, dim, layer, color)
+    elif isinstance(dim, RadialDimension):
+        _emit_dim_radial(out, dim, layer, color)
+    elif isinstance(dim, AngularDimension):
+        _emit_dim_angular(out, dim, layer, color)
+
 
 def _convert_primitive(out, prim, layer, color_aci, layer_color_aci):
     """color_aci — цвет конкретного примитива; если совпадает с цветом слоя,
@@ -415,6 +657,12 @@ def _convert_primitive(out, prim, layer, color_aci, layer_color_aci):
         approx = _catmull_rom(pts, samples_per_segment=20)
         _emit_polyline(out, layer, eff_color, approx, closed=False)
 
+    elif is_dimension_type(t):
+        # Размеры всегда экспортируются на специальный слой и в виде
+        # стандартных сущностей — это гарантирует совместимость со всеми
+        # CAD-программами и не требует поддержки DIMENSION/DIMSTYLE.
+        _emit_dimension(out, prim, DIMENSIONS_LAYER, eff_color)
+
     # Неизвестные типы тихо пропускаем.
 
 
@@ -446,6 +694,18 @@ def _accumulate_extent(prim, acc):
         cx, cy = p['cx'], p['cy']
         m = max(p['rx'], p['ry'])
         pts = [(cx - m, cy - m), (cx + m, cy + m)]
+    elif t == 'dim_linear':
+        pts = [p.get('p1', (0, 0)), p.get('p2', (0, 0)),
+               p.get('dim_pos', (0, 0))]
+    elif t == 'dim_radial':
+        cx, cy, r = p.get('cx', 0), p.get('cy', 0), p.get('r', 0)
+        pts = [(cx - r, cy - r), (cx + r, cy + r)]
+        if p.get('text_pos'):
+            pts.append(p['text_pos'])
+    elif t == 'dim_angular':
+        v = p.get('vertex', (0, 0))
+        R = p.get('arc_radius', 1.0)
+        pts = [(v[0] - R, v[1] - R), (v[0] + R, v[1] + R)]
 
     for x, y in pts:
         if acc[0] is None or x < acc[0]: acc[0] = x
@@ -489,6 +749,9 @@ def export_to_dxf(filepath, primitives, line_styles=None, units='mm',
     layers = {}                 # layer_name -> {'aci', 'ltype', 'rgb'}
     style_to_layer = {}         # style_name -> layer_name
     for prim in primitives:
+        # Размеры всегда уходят на отдельный слой (не на слой их style_name)
+        if is_dimension_type(prim['type']):
+            continue
         style_name = prim.get('style_name') or 'Сплошная основная'
         layer_name = sanitize_layer_name(style_name)
         style_to_layer[style_name] = layer_name
@@ -502,6 +765,19 @@ def export_to_dxf(filepath, primitives, line_styles=None, units='mm',
                 'ltype': ltype,
                 'rgb':   rgb,
             }
+
+    # Регистрируем слой 'Размеры', если есть размеры.
+    has_dims = any(is_dimension_type(p['type']) for p in primitives)
+    if has_dims:
+        dim_color = next((p.get('color')
+                          for p in primitives if is_dimension_type(p['type'])),
+                          default_color) or default_color
+        dim_rgb = hex_to_rgb(dim_color)
+        layers[DIMENSIONS_LAYER] = {
+            'aci':   rgb_to_aci(dim_rgb),
+            'ltype': 'CONTINUOUS',
+            'rgb':   dim_rgb,
+        }
 
     # 2) Расчёт габаритов.
     extent = [None, None, None, None]
@@ -540,8 +816,58 @@ def export_to_dxf(filepath, primitives, line_styles=None, units='mm',
     with open(filepath, 'w', encoding='cp1251', errors='replace', newline='') as f:
         f.write(text)
 
+    # 5) Сайдкар-файл для размеров (.dim.json).
+    #    DXF содержит только развёрнутую геометрию размеров — для других CAD.
+    #    Чтобы наше приложение могло восстановить редактируемые размеры
+    #    при следующем открытии, сохраняем их параметры рядом с DXF.
+    #    Файл с расширением .dim.json не мешает другим программам.
+    sidecar_n = _write_dim_sidecar(filepath, primitives)
+
     return {
         'entities': n_entities,
         'layers':   len(layers),
         'path':     filepath,
+        'dim_sidecar': sidecar_n,
     }
+
+
+# ----------------------------------------------------------------------
+# Сайдкар-файл с описаниями размеров.
+# ----------------------------------------------------------------------
+
+def _dim_sidecar_path(dxf_path):
+    base, _ = os.path.splitext(dxf_path)
+    return base + '.dim.json'
+
+
+def _write_dim_sidecar(dxf_path, primitives):
+    """Сохраняет размеры в JSON рядом с DXF. Возвращает число записанных размеров.
+    Если размеров нет — старый файл удаляется (если был)."""
+    dims = [p for p in primitives if is_dimension_type(p['type'])]
+    sidecar_path = _dim_sidecar_path(dxf_path)
+    if not dims:
+        try:
+            if os.path.isfile(sidecar_path):
+                os.remove(sidecar_path)
+        except OSError:
+            pass
+        return 0
+
+    payload = {
+        'format':  'geomod-dimensions',
+        'version': 1,
+        'dimensions': [
+            {
+                'type':       p['type'],
+                'name':       p.get('name', ''),
+                'color':      p.get('color', '#FFFFFF'),
+                'style_name': p.get('style_name', 'Сплошная тонкая'),
+                'id':         p.get('id'),
+                'params':     p['params'],
+            }
+            for p in dims
+        ],
+    }
+    with open(sidecar_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return len(dims)
